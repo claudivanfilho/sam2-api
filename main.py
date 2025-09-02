@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 from sam2.build_sam import build_sam2
 from pydantic import BaseModel
+from typing import Optional
 import torch
 from PIL import Image
 import io, base64
@@ -10,6 +11,10 @@ import os
 import numpy as np
 import requests
 import sys
+import boto3
+from botocore.exceptions import ClientError
+import uuid
+from datetime import datetime
 sys.path.append('/root/EVF-SAM')
 sys.path.append('/root/BiRefNet')
 from transformers import AutoTokenizer
@@ -17,8 +22,31 @@ import torch.nn.functional as F
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from models.birefnet import BiRefNet
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 app = FastAPI()
+
+# AWS S3 Configuration
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "growling-thunder-gold")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+
+# Initialize S3 client
+s3_client = None
+if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+    s3_client = boto3.client(
+        's3',
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=AWS_REGION
+    )
+    print(f"✅ S3 client initialized for bucket: {S3_BUCKET_NAME}")
+else:
+    print("⚠️  AWS credentials not found. S3 upload will be disabled.")
 
 # Add CORS middleware
 app.add_middleware(
@@ -50,7 +78,7 @@ class SegmentRequest(BaseModel):
     boxes: list[Box] = None     # Optional multiple boxes
 
 class SegmentResponse(BaseModel):
-    mask: list
+    mask_url: Optional[str] = None  # S3 URL of the uploaded mask image
 
 # EVF-SAM request model
 class EVFSegmentRequest(BaseModel):
@@ -179,6 +207,64 @@ def load_image_from_source(image_b64=None, image_url=None):
     
     return image
 
+def upload_mask_to_s3(mask_array, original_image_size=None):
+    """
+    Upload segmentation mask to S3 as a PNG image.
+    
+    Args:
+        mask_array: numpy array of the segmentation mask
+        original_image_size: tuple of (width, height) for resizing mask
+    
+    Returns:
+        str: S3 URL of the uploaded mask, or None if upload failed
+    """
+    if not s3_client:
+        print("⚠️  S3 client not initialized. Skipping upload.")
+        return None
+    
+    try:
+        # Convert mask to PIL Image
+        # Ensure mask is boolean/binary
+        mask_binary = (mask_array > 0).astype(np.uint8) * 255
+        mask_image = Image.fromarray(mask_binary, mode='L')
+        
+        # Resize to original image size if provided
+        if original_image_size:
+            mask_image = mask_image.resize(original_image_size, Image.NEAREST)
+        
+        # Convert to PNG bytes
+        buffer = io.BytesIO()
+        mask_image.save(buffer, format='PNG')
+        buffer.seek(0)
+        
+        # Generate unique filename with sam2-api-masks path
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = str(uuid.uuid4())[:8]
+        filename = f"sam2-api-masks/{timestamp}_{unique_id}.png"
+        
+        # Upload to S3
+        s3_client.upload_fileobj(
+            buffer,
+            S3_BUCKET_NAME,
+            filename,
+            ExtraArgs={
+                'ContentType': 'image/png',
+                'ACL': 'public-read'  # Make the file publicly accessible
+            }
+        )
+        
+        # Generate public URL
+        s3_url = f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{filename}"
+        print(f"✅ Mask uploaded to S3: {s3_url}")
+        return s3_url
+        
+    except ClientError as e:
+        print(f"❌ Failed to upload mask to S3: {e}")
+        return None
+    except Exception as e:
+        print(f"❌ Error uploading mask to S3: {e}")
+        return None
+
 def segment_image(image_b64=None, image_url=None, point=None, box=None, points=None, boxes=None):
     """
     Segment an image from base64 input or URL with optional prompts.
@@ -236,12 +322,17 @@ def segment_image(image_b64=None, image_url=None, point=None, box=None, points=N
     mask = masks[0]
     if hasattr(mask, 'cpu'):
         # It's a PyTorch tensor
-        mask = mask.cpu().numpy()
+        mask_array = mask.cpu().numpy()
     elif not isinstance(mask, np.ndarray):
         # Convert to numpy array if it's not already
-        mask = np.array(mask)
+        mask_array = np.array(mask)
+    else:
+        mask_array = mask
     
-    return mask.tolist()
+    # Upload mask to S3
+    mask_url = upload_mask_to_s3(mask_array, image.size)
+    
+    return mask_url
 
 @app.post("/segment", response_model=SegmentResponse)
 async def segment_runpod_style(request: SegmentRequest):
@@ -291,6 +382,13 @@ async def segment_runpod_style(request: SegmentRequest):
     }
     
     Note: Either image_b64 OR imageUrl must be provided (not both).
+    
+    Returns:
+    {
+      "mask_url": "https://your-bucket.s3.region.amazonaws.com/masks/20240902_143022_abc12345.png"
+    }
+    
+    The segmentation mask is automatically uploaded to S3 and only the URL is returned.
     """
     try:
         # Validate input
@@ -300,7 +398,7 @@ async def segment_runpod_style(request: SegmentRequest):
         if request.image_b64 and request.imageUrl:
             raise HTTPException(status_code=400, detail="Provide either image_b64 OR imageUrl, not both")
         
-        mask = segment_image(
+        mask_url = segment_image(
             image_b64=request.image_b64,
             image_url=request.imageUrl,
             point=request.point,
@@ -308,7 +406,7 @@ async def segment_runpod_style(request: SegmentRequest):
             points=request.points,
             boxes=request.boxes
         )
-        return SegmentResponse(mask=mask)
+        return SegmentResponse(mask_url=mask_url)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

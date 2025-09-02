@@ -2,6 +2,13 @@
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 
+# Environment variables
+python-dotenv>=1.0.0
+
+# AWS SDK
+boto3>=1.26.0
+botocore>=1.29.0
+
 # Core ML frameworks
 torch>=2.0.0
 torchvision>=0.15.0
