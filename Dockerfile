@@ -1,5 +1,5 @@
-# Use NVIDIA's PyTorch base image with CUDA support
-FROM pytorch/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
+# Use RunPod's PyTorch base image with CUDA support
+FROM runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
 
 # Build argument for GitHub token (optional)
 ARG GITHUB_TOKEN
