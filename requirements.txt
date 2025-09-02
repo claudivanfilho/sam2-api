@@ -34,6 +34,10 @@ hydra-core>=1.3.0
 # Additional ML dependencies
 einops>=0.6.0
 
+# Florence-2 specific dependencies
+timm>=0.9.0
+sentencepiece>=0.1.99
+
 # Optional performance optimizations (may fail on some systems)
 # flash-attn>=2.0.0
 # xformers>=0.0.20

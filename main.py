@@ -17,7 +17,7 @@ import uuid
 from datetime import datetime
 sys.path.append('/root/EVF-SAM')
 sys.path.append('/root/BiRefNet')
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoProcessor, AutoModelForCausalLM
 import torch.nn.functional as F
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
@@ -44,7 +44,7 @@ if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
         region_name=AWS_REGION
     )
-    print(f"✅ S3 client initialized for bucket: {S3_BUCKET_NAME}")
+    print(f"✅ S3 client initialized")
 else:
     print("⚠️  AWS credentials not found. S3 upload will be disabled.")
 
@@ -99,6 +99,24 @@ class RemoveBackgroundRequest(BaseModel):
 class RemoveBackgroundResponse(BaseModel):
     image_b64: str = None      # Base64 encoded result image (with transparent background)
     mask_b64: str = None       # Base64 encoded mask (if requested)
+
+# Object detection request model
+class ObjectDetectionRequest(BaseModel):
+    image_b64: str = None      # Optional base64 encoded image
+    imageUrl: str = None       # Optional image URL
+    task: str = "<OD>"         # Task prompt (default: object detection)
+    confidence_threshold: float = 0.3  # Minimum confidence for detections
+    text_input: str = None     # Text input for referring expression segmentation
+
+class DetectedObject(BaseModel):
+    label: str
+    bbox: list[float]  # [x1, y1, x2, y2]
+    confidence: Optional[float] = None
+
+class ObjectDetectionResponse(BaseModel):
+    objects: list[DetectedObject]
+    task_used: str
+    segmentation_mask: Optional[list] = None  # For RES tasks
 
 
 # Choose model (use relative paths like in SAM2 examples)
@@ -163,6 +181,24 @@ birefnet_transform = transforms.Compose([
 
 print("BiRefNet model loaded successfully!")
 
+# Initialize Florence-2 model for object detection
+print("Loading Florence-2-large (no flash-attn) model...")
+florence_device = "cuda" if torch.cuda.is_available() else "cpu"
+florence_torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+florence_model = AutoModelForCausalLM.from_pretrained(
+    "multimodalart/Florence-2-large-no-flash-attn", 
+    torch_dtype=florence_torch_dtype, 
+    trust_remote_code=True
+).to(florence_device)
+
+florence_processor = AutoProcessor.from_pretrained(
+    "multimodalart/Florence-2-large-no-flash-attn", 
+    trust_remote_code=True
+)
+
+print("Florence-2-large (no flash-attn) model loaded successfully!")
+
 
 # EVF-SAM preprocessing functions
 pixel_mean = torch.tensor([123.675, 116.28, 103.53]).view(3, 1, 1)
@@ -206,6 +242,82 @@ def load_image_from_source(image_b64=None, image_url=None):
         raise ValueError("Either image_b64 or imageUrl must be provided")
     
     return image
+
+def detect_objects_florence2(image_b64=None, image_url=None, task="<OD>", confidence_threshold=0.3, text_input=None):
+    """
+    Detect objects in an image using Florence-2-large model.
+    
+    Args:
+        image_b64: Base64 encoded image
+        image_url: URL to image
+        task: Task prompt (default: "<OD>" for object detection)
+        confidence_threshold: Minimum confidence for detections
+        text_input: Text input for referring expression segmentation
+        
+    Returns:
+        dict: Parsed detection results with objects and their bounding boxes
+    """
+    # Load image from either source
+    image = load_image_from_source(image_b64, image_url)
+    
+    # Handle referring expression segmentation
+    if task == "<REFERRING_EXPRESSION_SEGMENTATION>" and text_input:
+        prompt = f"<REFERRING_EXPRESSION_SEGMENTATION>{text_input}"
+    else:
+        prompt = task
+    
+    # Prepare inputs
+    inputs = florence_processor(text=prompt, images=image, return_tensors="pt").to(florence_device, florence_torch_dtype)
+    
+    # Generate predictions
+    with torch.no_grad():
+        generated_ids = florence_model.generate(
+            input_ids=inputs["input_ids"],
+            pixel_values=inputs["pixel_values"],
+            max_new_tokens=1024,
+            early_stopping=False,
+            do_sample=False,
+            num_beams=3,
+            use_cache=True
+        )
+    
+    # Decode and parse results
+    generated_text = florence_processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+    parsed_answer = florence_processor.post_process_generation(
+        generated_text, 
+        task=task, 
+        image_size=(image.width, image.height)
+    )
+    
+    # Format results
+    objects = []
+    segmentation_mask = None
+    
+    if task in parsed_answer:
+        detections = parsed_answer[task]
+        
+        # Handle different output formats
+        if 'bboxes' in detections and 'labels' in detections:
+            bboxes = detections['bboxes']
+            labels = detections['labels']
+            
+            for bbox, label in zip(bboxes, labels):
+                objects.append({
+                    'label': label,
+                    'bbox': bbox,  # [x1, y1, x2, y2]
+                    'confidence': None  # Florence-2 doesn't return confidence scores
+                })
+        
+        # Handle segmentation masks for RES tasks
+        if 'polygons' in detections:
+            segmentation_mask = detections['polygons']
+    
+    return {
+        'objects': objects,
+        'task_used': task,
+        'segmentation_mask': segmentation_mask,
+        'raw_output': parsed_answer
+    }
 
 def upload_mask_to_s3(mask_array, original_image_size=None):
     """
@@ -465,6 +577,90 @@ async def segment_evf(request: EVFSegmentRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"EVF segmentation failed: {str(e)}")
 
+@app.post("/detect-objects", response_model=ObjectDetectionResponse)
+async def detect_objects_endpoint(request: ObjectDetectionRequest):
+    """
+    Object detection endpoint using Florence-2-large model.
+    
+    Florence-2 is a vision foundation model that can perform various vision tasks through text prompts.
+    Supports object detection, image captioning, and referring expression segmentation.
+    
+    Example usage:
+    
+    1. Basic object detection with base64:
+    {
+      "image_b64": "<base64 encoded image>"
+    }
+    
+    2. Object detection with URL:
+    {
+      "imageUrl": "https://example.com/image.jpg"
+    }
+    
+    3. Referring expression segmentation (text-prompted segmentation):
+    {
+      "image_b64": "<base64 encoded image>",
+      "task": "<REFERRING_EXPRESSION_SEGMENTATION>",
+      "text_input": "hair"
+    }
+    
+    4. Custom task prompt:
+    {
+      "image_b64": "<base64 encoded image>",
+      "task": "<DENSE_REGION_CAPTION>"
+    }
+    
+    Supported tasks:
+    - "<OD>": Object detection (default)
+    - "<REFERRING_EXPRESSION_SEGMENTATION>": Segment objects by text description
+    - "<DENSE_REGION_CAPTION>": Dense region captioning
+    - "<REGION_PROPOSAL>": Region proposal
+    - "<CAPTION>": Image captioning
+    - "<DETAILED_CAPTION>": Detailed image captioning
+    - "<MORE_DETAILED_CAPTION>": More detailed image captioning
+    
+    Returns detected objects with labels and bounding boxes.
+    For RES tasks, also returns segmentation polygons.
+    Note: Florence-2 doesn't provide confidence scores, so confidence will be None.
+    """
+    try:
+        # Validate input
+        if not request.image_b64 and not request.imageUrl:
+            raise HTTPException(status_code=400, detail="Either image_b64 or imageUrl must be provided")
+        
+        if request.image_b64 and request.imageUrl:
+            raise HTTPException(status_code=400, detail="Provide either image_b64 OR imageUrl, not both")
+        
+        # Run object detection
+        result = detect_objects_florence2(
+            image_b64=request.image_b64,
+            image_url=request.imageUrl,
+            task=request.task,
+            confidence_threshold=request.confidence_threshold,
+            text_input=request.text_input
+        )
+        
+        # Convert to response format
+        objects = [
+            DetectedObject(
+                label=obj['label'],
+                bbox=obj['bbox'],
+                confidence=obj['confidence']
+            )
+            for obj in result['objects']
+        ]
+        
+        return ObjectDetectionResponse(
+            objects=objects,
+            task_used=result['task_used'],
+            segmentation_mask=result.get('segmentation_mask')
+        )
+        
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Object detection failed: {str(e)}")
+
 @app.post("/remove-background", response_model=RemoveBackgroundResponse)
 async def remove_background_endpoint(request: RemoveBackgroundRequest):
     """
@@ -525,11 +721,13 @@ async def health_check():
         "model_loaded": True,
         "evf_model_loaded": True,
         "background_removal_loaded": True,
+        "object_detection_loaded": True,
         "flux_model_loaded": False,
         "models": {
             "sam2": "SAM2.1 Large (Segmentation)",
             "evf_sam2": "EVF-SAM2 (Text-prompted Segmentation)",
-            "birefnet": "BiRefNet (Background Removal)"
+            "birefnet": "BiRefNet (Background Removal)",
+            "florence2": "Florence-2-large (Object Detection)"
         }
     }
 

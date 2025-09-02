@@ -103,12 +103,19 @@ echo "🔧 Upgrading timm for compatibility..."
 pip install --upgrade timm
 echo "✅ timm upgraded"
 
+# Install Florence-2 specific dependencies
+echo "🔧 Installing Florence-2 dependencies..."
+pip install --upgrade sentencepiece
+echo "✅ Florence-2 dependencies installed"
+
 # Download required model checkpoints
 echo "⬇️  Downloading model checkpoints..."
 cd /root/segment-anything-2
 mkdir -p checkpoints
 wget -O checkpoints/sam2.1_hiera_large.pt https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
 echo "✅ Model checkpoints downloaded"
+
+echo "ℹ️  Note: Florence-2-large-no-flash-attn model will be downloaded automatically on first API call"
 
 # Return to the original directory
 cd "$CURRENT_DIR"
