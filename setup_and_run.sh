@@ -9,7 +9,7 @@ echo "🚀 Starting SAM2 API setup..."
 
 # Update system packages and install dependencies
 echo "📦 Installing system dependencies..."
-sudo apt-get update && sudo apt-get install -y \
+apt-get update && apt-get install -y \
     git \
     wget \
     curl \
@@ -18,31 +18,44 @@ sudo apt-get update && sudo apt-get install -y \
     libsm6 \
     libxext6 \
     python3-pip \
-    && sudo rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/*
 
 echo "✅ System dependencies installed"
 
 # Create directories for repositories
 echo "📁 Creating repository directories..."
-sudo mkdir -p /root/segment-anything-2
-sudo mkdir -p /root/EVF-SAM
-sudo mkdir -p /root/BiRefNet
+mkdir -p /root/segment-anything-2
+mkdir -p /root/EVF-SAM
+mkdir -p /root/BiRefNet
 
 # Clone required repositories to fixed locations
 echo "📥 Cloning repositories..."
+
 echo "  - Cloning segment-anything-2..."
-sudo git clone https://github.com/facebookresearch/segment-anything-2.git /root/segment-anything-2
+if [ -d "/root/segment-anything-2" ]; then
+    echo "    Directory already exists, removing and re-cloning..."
+    rm -rf /root/segment-anything-2
+fi
+git clone https://github.com/facebookresearch/segment-anything-2.git /root/segment-anything-2
 
 echo "  - Cloning EVF-SAM..."
-sudo git clone https://github.com/YxZhang/EVF-SAM.git /root/EVF-SAM
+if [ -d "/root/EVF-SAM" ]; then
+    echo "    Directory already exists, removing and re-cloning..."
+    rm -rf /root/EVF-SAM
+fi
+git clone https://github.com/hustvl/EVF-SAM.git /root/EVF-SAM
 
 echo "  - Cloning BiRefNet..."
-sudo git clone https://github.com/ZhengPeng7/BiRefNet.git /root/BiRefNet
+if [ -d "/root/BiRefNet" ]; then
+    echo "    Directory already exists, removing and re-cloning..."
+    rm -rf /root/BiRefNet
+fi
+git clone https://github.com/ZhengPeng7/BiRefNet.git /root/BiRefNet
 
 echo "✅ All repositories cloned"
 
 # Get current directory (where this script is located)
-CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CURRENT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Install Python dependencies from requirements.txt
 echo "🐍 Installing Python dependencies..."
@@ -56,26 +69,45 @@ fi
 # Install SAM2 dependencies
 echo "🔧 Installing SAM2 dependencies..."
 cd /root/segment-anything-2
-sudo pip install -e .
+pip install -e .
 echo "✅ SAM2 dependencies installed"
 
 # Install EVF-SAM dependencies
 echo "🔧 Installing EVF-SAM dependencies..."
 cd /root/EVF-SAM
-sudo pip install -e .
-echo "✅ EVF-SAM dependencies installed"
+if [ -f "requirements.txt" ]; then
+    pip install -r requirements.txt
+    # Build extension for video prediction if needed
+    if [ -d "model/segment_anything_2" ]; then
+        cd model/segment_anything_2
+        python setup.py build_ext --inplace
+        cd /root/EVF-SAM
+    fi
+    echo "✅ EVF-SAM dependencies installed"
+else
+    echo "⚠️  requirements.txt not found in EVF-SAM directory"
+fi
 
 # Install BiRefNet dependencies
 echo "🔧 Installing BiRefNet dependencies..."
 cd /root/BiRefNet
-sudo pip install -e .
-echo "✅ BiRefNet dependencies installed"
+if [ -f "requirements.txt" ]; then
+    pip install -r requirements.txt
+    echo "✅ BiRefNet dependencies installed"
+else
+    echo "⚠️  requirements.txt not found in BiRefNet directory"
+fi
+
+# Fix timm version compatibility issue
+echo "🔧 Upgrading timm for compatibility..."
+pip install --upgrade timm
+echo "✅ timm upgraded"
 
 # Download required model checkpoints
 echo "⬇️  Downloading model checkpoints..."
 cd /root/segment-anything-2
-sudo mkdir -p checkpoints
-sudo wget -O checkpoints/sam2.1_hiera_large.pt https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
+mkdir -p checkpoints
+wget -O checkpoints/sam2.1_hiera_large.pt https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
 echo "✅ Model checkpoints downloaded"
 
 # Return to the original directory
