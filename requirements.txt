@@ -24,7 +24,7 @@ numpy>=1.21.0
 requests>=2.25.0
 
 # Transformers and HuggingFace
-transformers>=4.30.0
+transformers==4.41.2  # Pinned for Florence-2 compatibility
 accelerate>=0.20.0
 safetensors>=0.3.0
 huggingface-hub>=0.16.0
