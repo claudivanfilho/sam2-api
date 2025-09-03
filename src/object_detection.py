@@ -247,6 +247,9 @@ class ObjectDetector:
                     multiclass_duration = multiclass_end_time - multiclass_start_time
                     print(f"⏱️  Multiclass mask processing took {multiclass_duration:.3f} seconds for {label}")
                     
+                    # Initialize refined_crop_info for later use in landmarks
+                    refined_crop_info = None
+                    
                     # Reprocess with refined crop based on hair and face_skin regions
                     if processed_classes and ('hair' in processed_classes or 'face_skin' in processed_classes):
                         refined_crop_start_time = time.time()
@@ -285,14 +288,27 @@ class ObjectDetector:
                     
                     if processed_classes:
                         obj['multiclasses'] = processed_classes
-                
-                # Run face landmark detection on the cropped person
-                landmarks_start_time = time.time()
-                landmarks_result = mediapipe_processor.detect_face_landmarks(image_pil=cropped_object)
-                landmarks_end_time = time.time()
-                landmarks_duration = landmarks_end_time - landmarks_start_time
-                print(f"⏱️  MediaPipe face landmarks took {landmarks_duration:.3f} seconds for {label}")
-                obj['face_landmarks'] = landmarks_result
+                    
+                    # Run face landmark detection - use refined crop if available, otherwise use original crop
+                    landmarks_image = cropped_object  # Default to original crop
+                    if refined_crop_info and refined_crop_info['image']:
+                        landmarks_image = refined_crop_info['image']
+                        print(f"🎯 Using refined crop for face landmarks: {landmarks_image.size}")
+                    
+                    landmarks_start_time = time.time()
+                    landmarks_result = mediapipe_processor.detect_face_landmarks(image_pil=landmarks_image)
+                    landmarks_end_time = time.time()
+                    landmarks_duration = landmarks_end_time - landmarks_start_time
+                    print(f"⏱️  MediaPipe face landmarks took {landmarks_duration:.3f} seconds for {label}")
+                    obj['face_landmarks'] = landmarks_result
+                else:
+                    # Run face landmark detection on the cropped person (fallback when no selfie segmentation)
+                    landmarks_start_time = time.time()
+                    landmarks_result = mediapipe_processor.detect_face_landmarks(image_pil=cropped_object)
+                    landmarks_end_time = time.time()
+                    landmarks_duration = landmarks_end_time - landmarks_start_time
+                    print(f"⏱️  MediaPipe face landmarks took {landmarks_duration:.3f} seconds for {label}")
+                    obj['face_landmarks'] = landmarks_result
                 
         except Exception as e:
             print(f"⚠️  Failed to process object {label}: {e}")
