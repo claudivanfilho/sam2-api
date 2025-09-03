@@ -236,7 +236,55 @@ class ObjectDetector:
                 selfie_end_time = time.time()
                 selfie_duration = selfie_end_time - selfie_start_time
                 print(f"⏱️  MediaPipe selfie segmentation took {selfie_duration:.3f} seconds for {label}")
-                # obj['multiclasses'] = selfie_result  # Commented out to reduce response size
+                
+                # Process only hair, face-skin, and items classes, intersected with SAM2 mask
+                if selfie_result and 'mask' in selfie_result:
+                    multiclass_start_time = time.time()
+                    processed_classes = self._process_selfie_multiclass_masks(
+                        selfie_result, mask_array, x1, y1, x2, y2, original_image
+                    )
+                    multiclass_end_time = time.time()
+                    multiclass_duration = multiclass_end_time - multiclass_start_time
+                    print(f"⏱️  Multiclass mask processing took {multiclass_duration:.3f} seconds for {label}")
+                    
+                    # Reprocess with refined crop based on hair and face_skin regions
+                    if processed_classes and ('hair' in processed_classes or 'face_skin' in processed_classes):
+                        refined_crop_start_time = time.time()
+                        
+                        # Get the refined crop based on hair and face_skin regions
+                        refined_crop_info = self._get_refined_crop_from_masks(
+                            selfie_result, cropped_object
+                        )
+                        
+                        if refined_crop_info and refined_crop_info['image']:
+                            refined_cropped_image = refined_crop_info['image']
+                            print(f"🔄 Reprocessing with refined crop: {refined_cropped_image.size}")
+                            
+                            # Run MediaPipe segmentation again on the refined crop
+                            refined_selfie_result = mediapipe_processor.segment_selfie_multiclass(
+                                image_pil=refined_cropped_image
+                            )
+                            
+                            if refined_selfie_result and 'mask' in refined_selfie_result:
+                                # Reprocess the masks with the refined segmentation
+                                # Still need SAM2 intersection but with adjusted coordinates for refined crop
+                                refined_processed_classes = self._process_refined_multiclass_masks(
+                                    refined_selfie_result, refined_cropped_image, mask_array, x1, y1, x2, y2, original_image
+                                )
+                                
+                                # Replace the original processed_classes with refined ones
+                                if refined_processed_classes:
+                                    # Replace original masks with refined masks (same keys)
+                                    for class_name, s3_url in refined_processed_classes.items():
+                                        processed_classes[class_name] = s3_url
+                                    
+                                    refined_crop_end_time = time.time()
+                                    refined_crop_duration = refined_crop_end_time - refined_crop_start_time
+                                    print(f"🚀 Refined crop reprocessing took {refined_crop_duration:.3f} seconds")
+                                    print(f"✅ Original masks replaced with refined versions: {list(refined_processed_classes.keys())}")
+                    
+                    if processed_classes:
+                        obj['multiclasses'] = processed_classes
                 
                 # Run face landmark detection on the cropped person
                 landmarks_start_time = time.time()
@@ -252,6 +300,258 @@ class ObjectDetector:
             pass
         
         return obj
+    
+    def _process_selfie_multiclass_masks(self, selfie_result, mask_array, x1, y1, x2, y2, original_image):
+        """
+        Process selfie segmentation masks, intersect with SAM2 mask, and upload to S3 in parallel.
+        Only processes hair, face_skin, and others categories.
+        
+        Args:
+            selfie_result: MediaPipe selfie segmentation result
+            mask_array: SAM2 mask array (full image dimensions)
+            x1, y1, x2, y2: Bounding box coordinates for cropping
+            original_image: PIL Image object for sizing
+            
+        Returns:
+            dict: Dictionary of class names to S3 URLs, or None if no valid masks
+        """
+        # Convert selfie mask to numpy array (MediaPipe output for the cropped person region)
+        selfie_mask = np.array(selfie_result['mask'], dtype=np.uint8)
+        
+        # Crop the SAM2 mask to match the cropped object dimensions
+        # mask_array is based on original image, so we need to crop it to the bounding box
+        sam2_mask_cropped = mask_array[y1:y2, x1:x2]
+        
+        print(f"🔍 Dimension check - Selfie mask: {selfie_mask.shape}, SAM2 cropped mask: {sam2_mask_cropped.shape}")
+        
+        # Convert SAM2 mask to boolean for intersection operations
+        # Resize SAM2 mask to match selfie mask dimensions if needed
+        if sam2_mask_cropped.shape != selfie_mask.shape:
+            from PIL import Image
+            print(f"🔄 Resizing SAM2 mask from {sam2_mask_cropped.shape} to {selfie_mask.shape}")
+            sam2_mask_pil = Image.fromarray((sam2_mask_cropped > 0).astype(np.uint8) * 255)
+            sam2_mask_pil = sam2_mask_pil.resize((selfie_mask.shape[1], selfie_mask.shape[0]), Image.Resampling.NEAREST)
+            sam2_mask_cropped = np.array(sam2_mask_pil) > 0
+        else:
+            print(f"✅ Dimensions match perfectly, no resizing needed")
+            sam2_mask_cropped = sam2_mask_cropped > 0
+        
+        # Process specific classes based on MediaPipe multiclass mapping:
+        # (0=Background, 1=Hair, 2=Body-skin, 3=Face-skin, 4=Clothes, 5=Others)
+        # We only want: hair (1), face-skin (3), and others (5)
+        masks_to_upload = []
+        class_names = []
+        
+        # Hair class (1)
+        hair_mask = (selfie_mask == 1) & sam2_mask_cropped
+        if np.any(hair_mask):
+            masks_to_upload.append(hair_mask.astype(np.uint8) * 255)
+            class_names.append('hair')
+        
+        # Face-skin class (3)  
+        face_skin_mask = (selfie_mask == 3) & sam2_mask_cropped
+        if np.any(face_skin_mask):
+            masks_to_upload.append(face_skin_mask.astype(np.uint8) * 255)
+            class_names.append('face_skin')
+        
+        # Others class (5)
+        others_mask = (selfie_mask == 5) & sam2_mask_cropped
+        if np.any(others_mask):
+            masks_to_upload.append(others_mask.astype(np.uint8) * 255)
+            class_names.append('others')
+        
+        # Batch upload all masks to S3 in parallel
+        if masks_to_upload:
+            batch_upload_start_time = time.time()
+            
+            # Use the actual mask dimensions instead of original image size
+            # Since selfie_mask is from the cropped person region
+            mask_size = (selfie_mask.shape[1], selfie_mask.shape[0])  # (width, height)
+            
+            # Use ThreadPoolExecutor for parallel S3 uploads
+            with ThreadPoolExecutor(max_workers=3) as upload_executor:
+                # Submit all upload tasks simultaneously - no crop_box needed since masks are already cropped
+                upload_futures = {
+                    upload_executor.submit(upload_mask_to_s3, mask, mask_size, s3_path="body_parts"): class_name
+                    for mask, class_name in zip(masks_to_upload, class_names)
+                }
+                
+                # Collect results as they complete
+                processed_classes = {}
+                for future in as_completed(upload_futures):
+                    class_name = upload_futures[future]
+                    try:
+                        s3_url = future.result()
+                        if s3_url:  # Only add if upload was successful
+                            processed_classes[class_name] = s3_url
+                    except Exception as e:
+                        print(f"⚠️  Failed to upload {class_name} mask: {e}")
+            
+            batch_upload_end_time = time.time()
+            batch_upload_duration = batch_upload_end_time - batch_upload_start_time
+            print(f"🚀 Batch S3 upload took {batch_upload_duration:.3f} seconds for {len(processed_classes)} class masks")
+            
+            return processed_classes if processed_classes else None
+        
+        return None
+    
+    def _get_refined_crop_from_masks(self, selfie_result, cropped_image):
+        """
+        Create a refined crop from the original cropped image based on hair and face_skin regions.
+        Crops from Y coordinate 0 (top) to the bottommost pixel of either face_skin or hair.
+        
+        Args:
+            selfie_result: MediaPipe selfie segmentation result
+            cropped_image: PIL Image of the original cropped person
+            
+        Returns:
+            dict: Contains 'image' (PIL.Image), or None if no valid regions found
+        """
+        try:
+            selfie_mask = np.array(selfie_result['mask'], dtype=np.uint8)
+            
+            # Find hair pixels (class 1) and face_skin pixels (class 3)
+            hair_pixels = np.where(selfie_mask == 1)
+            face_skin_pixels = np.where(selfie_mask == 3)
+            
+            # Check if we have either hair or face_skin regions
+            if len(hair_pixels[0]) == 0 and len(face_skin_pixels[0]) == 0:
+                print("⚠️  No hair or face_skin regions found for refined crop")
+                return None
+            
+            # Get the bottommost y-coordinate from both hair and face_skin
+            bottom_y_coords = []
+            if len(hair_pixels[0]) > 0:
+                bottom_y_coords.extend(hair_pixels[0])
+            if len(face_skin_pixels[0]) > 0:
+                bottom_y_coords.extend(face_skin_pixels[0])
+            
+            if not bottom_y_coords:
+                return None
+                
+            # Start from top (Y=0) and go to the bottommost pixel
+            refined_top = 0
+            bottom_y = max(bottom_y_coords)
+            
+            # Add some padding (10% of the detected height range)
+            detected_height = bottom_y - refined_top
+            padding = max(10, int(detected_height * 0.1))
+            
+            # Ensure coordinates are within image bounds
+            refined_bottom = min(selfie_mask.shape[0], bottom_y + padding)
+            
+            # Crop the image from top to bottom of detected regions (keep full width)
+            refined_cropped = cropped_image.crop((0, refined_top, cropped_image.width, refined_bottom))
+            
+            print(f"📐 Refined crop: original {cropped_image.size} -> refined {refined_cropped.size}")
+            print(f"   Y-range: {refined_top}-{refined_bottom} (hair bottom: {hair_pixels[0].max() if len(hair_pixels[0]) > 0 else 'N/A'}, face bottom: {face_skin_pixels[0].max() if len(face_skin_pixels[0]) > 0 else 'N/A'})")
+            print(f"   Final bottom Y: {bottom_y} + padding: {padding} = {refined_bottom}")
+            
+            return {
+                'image': refined_cropped
+            }
+            
+        except Exception as e:
+            print(f"⚠️  Failed to create refined crop: {e}")
+            return None
+    
+    def _process_refined_multiclass_masks(self, refined_selfie_result, refined_cropped_image, mask_array, x1, y1, x2, y2, original_image):
+        """
+        Process refined selfie segmentation masks with SAM2 intersection.
+        Only processes hair, face_skin, and others categories from the refined crop.
+        Since refined crop always starts from Y=0, SAM2 intersection is straightforward.
+        
+        Args:
+            refined_selfie_result: MediaPipe selfie segmentation result from refined crop
+            refined_cropped_image: PIL Image of the refined cropped region
+            mask_array: SAM2 mask array (full image dimensions)
+            x1, y1, x2, y2: Original bounding box coordinates
+            original_image: PIL Image object for sizing
+            
+        Returns:
+            dict: Dictionary of class names to S3 URLs, or None if no valid masks
+        """
+        try:
+            # Convert refined selfie mask to numpy array
+            refined_selfie_mask = np.array(refined_selfie_result['mask'], dtype=np.uint8)
+            
+            # Get the SAM2 mask for the original crop region
+            sam2_mask_cropped = mask_array[y1:y2, x1:x2]
+            
+            # Since refined crop always starts from Y=0, extract SAM2 region from top
+            original_crop_height = y2 - y1
+            refined_crop_height = refined_cropped_image.height
+            
+            # Extract SAM2 region from top of the original crop up to refined crop height
+            sam2_refined_end = min(original_crop_height, refined_crop_height)
+            sam2_mask_refined = sam2_mask_cropped[0:sam2_refined_end, :]
+            
+            print(f"🔍 Refined dimension check - Selfie mask: {refined_selfie_mask.shape}, SAM2 refined mask: {sam2_mask_refined.shape}")
+            print(f"   SAM2 region from top: 0-{sam2_refined_end}")
+            
+            # Resize SAM2 mask to match refined selfie mask dimensions if needed
+            if sam2_mask_refined.shape != refined_selfie_mask.shape:
+                from PIL import Image
+                print(f"🔄 Resizing SAM2 refined mask from {sam2_mask_refined.shape} to {refined_selfie_mask.shape}")
+                sam2_mask_pil = Image.fromarray((sam2_mask_refined > 0).astype(np.uint8) * 255)
+                sam2_mask_pil = sam2_mask_pil.resize((refined_selfie_mask.shape[1], refined_selfie_mask.shape[0]), Image.Resampling.NEAREST)
+                sam2_mask_refined_resized = np.array(sam2_mask_pil) > 0
+            else:
+                print(f"✅ Refined dimensions match perfectly, no resizing needed")
+                sam2_mask_refined_resized = sam2_mask_refined > 0
+            
+            # Process specific classes with SAM2 intersection
+            masks_to_upload = []
+            class_names = []
+            
+            # Hair class (1)
+            hair_mask = (refined_selfie_mask == 1) & sam2_mask_refined_resized
+            if np.any(hair_mask):
+                masks_to_upload.append(hair_mask.astype(np.uint8) * 255)
+                class_names.append('hair')
+            
+            # Face-skin class (3)  
+            face_skin_mask = (refined_selfie_mask == 3) & sam2_mask_refined_resized
+            if np.any(face_skin_mask):
+                masks_to_upload.append(face_skin_mask.astype(np.uint8) * 255)
+                class_names.append('face_skin')
+            
+            # Others class (5)
+            others_mask = (refined_selfie_mask == 5) & sam2_mask_refined_resized
+            if np.any(others_mask):
+                masks_to_upload.append(others_mask.astype(np.uint8) * 255)
+                class_names.append('others')
+            
+            # Batch upload all refined masks to S3 in parallel
+            if masks_to_upload:
+                mask_size = (refined_selfie_mask.shape[1], refined_selfie_mask.shape[0])  # (width, height)
+                
+                # Use ThreadPoolExecutor for parallel S3 uploads
+                with ThreadPoolExecutor(max_workers=3) as upload_executor:
+                    upload_futures = {
+                        upload_executor.submit(upload_mask_to_s3, mask, mask_size, s3_path="body_parts_refined"): class_name
+                        for mask, class_name in zip(masks_to_upload, class_names)
+                    }
+                    
+                    # Collect results as they complete
+                    processed_classes = {}
+                    for future in as_completed(upload_futures):
+                        class_name = upload_futures[future]
+                        try:
+                            s3_url = future.result()
+                            if s3_url:  # Only add if upload was successful
+                                processed_classes[class_name] = s3_url
+                        except Exception as e:
+                            print(f"⚠️  Failed to upload refined {class_name} mask: {e}")
+                    
+                    print(f"✅ Refined masks with SAM2 intersection uploaded: {len(processed_classes)} classes")
+                    return processed_classes if processed_classes else None
+            
+            return None
+            
+        except Exception as e:
+            print(f"⚠️  Failed to process refined multiclass masks: {e}")
+            return None
 
 # Create global instance without initializing models
 object_detector = ObjectDetector()

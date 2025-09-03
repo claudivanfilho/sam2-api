@@ -5,7 +5,15 @@ Provides multiclass person segmentation and detailed face landmark detection.
 
 import numpy as np
 import mediapipe as mp
-from .utils import load_image_from_source
+import requests
+import tempfile
+import os
+
+# Handle imports for both module and standalone usage
+try:
+    from .utils import load_image_from_source
+except ImportError:
+    from utils import load_image_from_source
 
 class MediaPipeProcessor:
     """Handles MediaPipe operations for face and body analysis."""
@@ -14,10 +22,43 @@ class MediaPipeProcessor:
         # MediaPipe solutions
         self.mp_selfie_segmentation = mp.solutions.selfie_segmentation
         self.mp_face_mesh = mp.solutions.face_mesh
+        
+        # Download and cache the multiclass model
+        self.multiclass_model_path = self._download_multiclass_model()
+    
+    def _download_multiclass_model(self):
+        """Download the multiclass selfie segmentation model if not already cached."""
+        model_url = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/1/selfie_multiclass_256x256.tflite"
+        
+        # Create a cache directory
+        cache_dir = os.path.expanduser("~/.mediapipe_models")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        model_path = os.path.join(cache_dir, "selfie_multiclass_256x256.tflite")
+        
+        # Download if not exists
+        if not os.path.exists(model_path):
+            print(f"📥 Downloading multiclass selfie segmentation model...")
+            try:
+                response = requests.get(model_url, stream=True)
+                response.raise_for_status()
+                
+                with open(model_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                
+                print(f"✅ Model downloaded successfully to {model_path}")
+            except Exception as e:
+                print(f"❌ Failed to download model: {e}")
+                return None
+        else:
+            print(f"✅ Using cached multiclass model: {model_path}")
+            
+        return model_path
     
     def segment_selfie_multiclass(self, image_b64=None, image_url=None, image_pil=None):
         """
-        Segment a selfie image using MediaPipe's multiclass selfie segmenter.
+        Segment a selfie image using MediaPipe's true multiclass selfie segmenter.
         
         Args:
             image_b64: Base64 encoded image
@@ -27,12 +68,15 @@ class MediaPipeProcessor:
         Returns:
             dict: Contains the segmentation mask with multiple classes:
                 - 0: background
-                - 1: person (hair, body-skin, face-skin, clothes)
-                - 2: hair
-                - 3: body-skin
-                - 4: face-skin  
-                - 5: clothes
+                - 1: hair
+                - 2: body-skin
+                - 3: face-skin  
+                - 4: clothes
+                - 5: others (accessories, etc.)
         """
+        if not self.multiclass_model_path:
+            raise ValueError("Multiclass model not available. Please check model download.")
+            
         # Load image from source
         if image_pil is not None:
             image = image_pil
@@ -42,31 +86,39 @@ class MediaPipeProcessor:
         # Convert PIL image to numpy array
         image_np = np.array(image)
         
-        # Create the segmenter with multiclass model
-        with self.mp_selfie_segmentation.SelfieSegmentation(model_selection=1) as selfie_segmentation:
-            # Process the image
-            results = selfie_segmentation.process(image_np)
+        # Create ImageSegmenter with the multiclass model
+        base_options = mp.tasks.BaseOptions(model_asset_path=self.multiclass_model_path)
+        options = mp.tasks.vision.ImageSegmenterOptions(
+            base_options=base_options,
+            running_mode=mp.tasks.vision.RunningMode.IMAGE,
+            output_category_mask=True,
+            output_confidence_masks=False
+        )
+        
+        with mp.tasks.vision.ImageSegmenter.create_from_options(options) as segmenter:
+            # Create MediaPipe Image object
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_np)
             
-            # Get segmentation mask (values 0-5 for different classes)
-            segmentation_mask = results.segmentation_mask
+            # Perform segmentation
+            segmentation_result = segmenter.segment(mp_image)
             
-            # Convert to proper data type and scale
-            if segmentation_mask is not None:
-                # MediaPipe returns float values, convert to integer classes
-                segmentation_mask = (segmentation_mask * 255).astype(np.uint8)
+            if segmentation_result.category_mask is not None:
+                # Get the category mask (contains class indices 0-5)
+                category_mask = segmentation_result.category_mask.numpy_view()
                 
                 return {
-                    "mask": segmentation_mask.tolist(),
-                    "width": segmentation_mask.shape[1], 
-                    "height": segmentation_mask.shape[0],
+                    "mask": category_mask.tolist(),
+                    "width": category_mask.shape[1], 
+                    "height": category_mask.shape[0],
                     "classes": {
                         0: "background",
-                        1: "person",
-                        2: "hair", 
-                        3: "body-skin",
-                        4: "face-skin",
-                        5: "clothes"
-                    }
+                        1: "hair",
+                        2: "body-skin", 
+                        3: "face-skin",
+                        4: "clothes",
+                        5: "others"
+                    },
+                    "model": "selfie_multiclass_256x256"
                 }
             else:
                 raise ValueError("Failed to generate segmentation mask")

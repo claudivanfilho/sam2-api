@@ -70,7 +70,7 @@ def load_image_from_source(image_b64=None, image_url=None):
     
     return image
 
-def upload_mask_to_s3(mask_array, original_image_size=None, crop_box=None):
+def upload_mask_to_s3(mask_array, original_image_size=None, crop_box=None, s3_path="sam2-api-masks"):
     """
     Upload segmentation mask to S3 as a 1-bit PNG image for optimal binary image compression.
     
@@ -78,6 +78,7 @@ def upload_mask_to_s3(mask_array, original_image_size=None, crop_box=None):
         mask_array: numpy array of the segmentation mask
         original_image_size: tuple of (width, height) for resizing mask
         crop_box: tuple of (x1, y1, x2, y2) to crop the mask before uploading
+        s3_path: The path (prefix) in the S3 bucket to upload the mask to
     
     Returns:
         str: S3 URL of the uploaded mask, or None if upload failed
@@ -117,10 +118,10 @@ def upload_mask_to_s3(mask_array, original_image_size=None, crop_box=None):
         mask_image.save(buffer, format='PNG', optimize=False, compress_level=1)
         buffer.seek(0)
         
-        # Generate unique filename with sam2-api-masks path
+        # Generate unique filename with specified S3 path
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         unique_id = str(uuid.uuid4())[:8]
-        filename = f"sam2-api-masks/{timestamp}_{unique_id}.png"
+        filename = f"{s3_path.strip('/')}/{timestamp}_{unique_id}.png"
         
         # Upload to S3 with optimized settings
         s3_client.upload_fileobj(
