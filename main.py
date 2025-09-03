@@ -15,6 +15,8 @@ import boto3
 from botocore.exceptions import ClientError
 import uuid
 from datetime import datetime
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 sys.path.append('/root/EVF-SAM')
 sys.path.append('/root/BiRefNet')
 from transformers import AutoTokenizer, AutoProcessor, AutoModelForCausalLM
@@ -23,6 +25,7 @@ from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from models.birefnet import BiRefNet
 from dotenv import load_dotenv
+import mediapipe as mp
 
 # Load environment variables from .env file
 load_dotenv()
@@ -112,6 +115,8 @@ class DetectedObject(BaseModel):
     label: str
     bbox: list[float]  # [x1, y1, x2, y2]
     confidence: Optional[float] = None
+    multiclasses: Optional[dict] = None  # Selfie segmentation result for person objects
+    segment_mask: Optional[str] = None  # S3 URL of SAM2 segmentation mask for the cropped object
 
 class ObjectDetectionResponse(BaseModel):
     objects: list[DetectedObject]
@@ -243,6 +248,100 @@ def load_image_from_source(image_b64=None, image_url=None):
     
     return image
 
+def process_detected_object(bbox, label, image_array, allowed_labels, person_labels, original_image):
+    """
+    Process a single detected object (bbox + label) with segmentation.
+    This function is designed to be run in parallel for multiple objects.
+    
+    Args:
+        bbox: Bounding box coordinates [x1, y1, x2, y2]
+        label: Object label string
+        image_array: Preprocessed numpy array (already set in predictor)
+        allowed_labels: List of allowed object labels
+        person_labels: List of person-related labels for selfie segmentation
+        original_image: PIL Image object for cropping
+        
+    Returns:
+        dict: Processed object with segmentation results, or None if filtered out
+    """
+    # Filter out objects that are not in the allowed list
+    if not any(allowed_word == label.lower() for allowed_word in allowed_labels):
+        return None  # Skip this object
+    
+    obj = {
+        'label': label,
+        'bbox': bbox,  # [x1, y1, x2, y2]
+        'confidence': None,  # Florence-2 doesn't return confidence scores
+        'multiclasses': None,
+        'segment_mask': None
+    }
+    
+    # Crop the detected object from the original image for segmentation
+    try:
+        x1, y1, x2, y2 = [int(coord) for coord in bbox]
+        
+        # Ensure coordinates are within image bounds
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(original_image.width, x2)
+        y2 = min(original_image.height, y2)
+        
+        image_processing_start_time = time.time()
+        # Crop the object from the image
+        cropped_object = original_image.crop((x1, y1, x2, y2))
+        
+        image_processing_end_time = time.time()
+        image_processing_duration = image_processing_end_time - image_processing_start_time
+        print(f"⏱️  Image processing (crop) took {image_processing_duration:.3f} seconds for {label}")
+        
+        # Run SAM2 segmentation using the already preprocessed image
+        sam2_start_time = time.time()
+        
+        # Prepare box input for SAM2
+        input_boxes = np.array([[x1, y1, x2, y2]], dtype=np.float32)
+        
+        # Run inference directly without set_image (image already preprocessed)
+        with torch.no_grad():
+            masks, scores, logits = predictor.predict(
+                point_coords=None,
+                point_labels=None,
+                box=input_boxes,
+                multimask_output=False
+            )
+        
+        # Process mask and upload to S3
+        mask_array = masks[0]
+        if hasattr(mask_array, 'cpu'):
+            mask_array = mask_array.cpu().numpy()
+        elif not isinstance(mask_array, np.ndarray):
+            mask_array = np.asarray(mask_array)
+        
+        # Crop mask to bounding box for upload
+        crop_box = (x1, y1, x2, y2)
+        segment_mask_url = upload_mask_to_s3(mask_array, original_image.size, crop_box=crop_box)
+        
+        sam2_end_time = time.time()
+        sam2_duration = sam2_end_time - sam2_start_time
+        print(f"⏱️  SAM2 segmentation took {sam2_duration:.3f} seconds for {label}")
+        obj['segment_mask'] = segment_mask_url
+        
+        # Check if detected object is a person and run selfie segmentation
+        if any(person_word in label.lower() for person_word in person_labels):
+            # Run selfie segmentation on the cropped person
+            selfie_start_time = time.time()
+            selfie_result = segment_selfie_multiclass(image_pil=cropped_object)
+            selfie_end_time = time.time()
+            selfie_duration = selfie_end_time - selfie_start_time
+            print(f"⏱️  MediaPipe selfie segmentation took {selfie_duration:.3f} seconds for {label}")
+            # obj['multiclasses'] = selfie_result
+            
+    except Exception as e:
+        print(f"⚠️  Failed to process object {label}: {e}")
+        # Continue without segmentation if it fails
+        pass
+    
+    return obj
+
 def detect_objects_florence2(image_b64=None, image_url=None, task="<OD>", confidence_threshold=0.3, text_input=None):
     """
     Detect objects in an image using Florence-2-large model.
@@ -269,17 +368,42 @@ def detect_objects_florence2(image_b64=None, image_url=None, task="<OD>", confid
     # Prepare inputs
     inputs = florence_processor(text=prompt, images=image, return_tensors="pt").to(florence_device, florence_torch_dtype)
     
-    # Generate predictions
-    with torch.no_grad():
-        generated_ids = florence_model.generate(
-            input_ids=inputs["input_ids"],
-            pixel_values=inputs["pixel_values"],
-            max_new_tokens=1024,
-            early_stopping=False,
-            do_sample=False,
-            num_beams=3,
-            use_cache=True
-        )
+    # Run Florence-2 detection and SAM2 preprocessing in parallel for maximum efficiency
+    florence_start_time = time.time()
+    
+    def run_florence_detection():
+        """Run Florence-2 object detection"""
+        with torch.no_grad():
+            generated_ids = florence_model.generate(
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs["pixel_values"],
+                max_new_tokens=1024,
+                early_stopping=False,
+                do_sample=False,
+                num_beams=3,
+                use_cache=True
+            )
+        return generated_ids
+    
+    def run_sam2_preprocessing():
+        """Preprocess image for SAM2"""
+        image_array = np.array(image)
+        predictor.set_image(image_array)
+        return image_array
+    
+    # Execute both operations in parallel
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        # Submit both tasks simultaneously
+        florence_future = executor.submit(run_florence_detection)
+        sam2_future = executor.submit(run_sam2_preprocessing)
+        
+        # Get results as they complete
+        generated_ids = florence_future.result()
+        image_array = sam2_future.result()
+    
+    florence_end_time = time.time()
+    florence_duration = florence_end_time - florence_start_time
+    print(f"⏱️  Florence-2 detection + SAM2 preprocessing (parallel) took {florence_duration:.3f} seconds")
     
     # Decode and parse results
     generated_text = florence_processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
@@ -301,12 +425,44 @@ def detect_objects_florence2(image_b64=None, image_url=None, task="<OD>", confid
             bboxes = detections['bboxes']
             labels = detections['labels']
             
-            for bbox, label in zip(bboxes, labels):
-                objects.append({
-                    'label': label,
-                    'bbox': bbox,  # [x1, y1, x2, y2]
-                    'confidence': None  # Florence-2 doesn't return confidence scores
-                })
+            # Define allowed object labels to keep
+            allowed_labels = [
+                'man', 'woman', 'boy', 'girl', 'person', 'people', 'human',
+                'dog', 'cat', 'horse',
+                'car', 'truck', 'bicycle', 'bus', 'vehicle', 'motorcycle'
+            ]
+            
+            # Define person-related labels to trigger selfie segmentation
+            person_labels = ['human', 'man', 'woman', 'boy', 'girl', 'person', 'people']
+            
+            # SAM2 preprocessing already completed in parallel above - no need to repeat
+            print(f"🔄 SAM2 image preprocessing completed in parallel with Florence-2")
+            
+            # Process objects in parallel for better performance
+            objects = []
+            parallel_start_time = time.time()
+            
+            # Use ThreadPoolExecutor to process multiple objects simultaneously
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                # Submit all object processing tasks with preprocessed image
+                future_to_data = {
+                    executor.submit(process_detected_object, bbox, label, image_array, allowed_labels, person_labels, image): (bbox, label)
+                    for bbox, label in zip(bboxes, labels)
+                }
+                
+                # Collect results as they complete
+                for future in as_completed(future_to_data):
+                    bbox, label = future_to_data[future]
+                    try:
+                        result = future.result()
+                        if result is not None:  # Only add non-filtered objects
+                            objects.append(result)
+                    except Exception as e:
+                        print(f"⚠️  Parallel processing failed for object {label}: {e}")
+            
+            parallel_end_time = time.time()
+            parallel_duration = parallel_end_time - parallel_start_time
+            print(f"🚀 Parallel object processing took {parallel_duration:.3f} seconds for {len(objects)} objects")
         
         # Handle segmentation masks for RES tasks
         if 'polygons' in detections:
@@ -319,13 +475,15 @@ def detect_objects_florence2(image_b64=None, image_url=None, task="<OD>", confid
         'raw_output': parsed_answer
     }
 
-def upload_mask_to_s3(mask_array, original_image_size=None):
+def upload_mask_to_s3(mask_array, original_image_size=None, crop_box=None):
     """
-    Upload segmentation mask to S3 as a PNG image.
+    Upload segmentation mask to S3 as a 1-bit PNG image for optimal binary image compression with universal browser support.
+    Optimized for performance with reduced PIL operations and faster compression.
     
     Args:
         mask_array: numpy array of the segmentation mask
         original_image_size: tuple of (width, height) for resizing mask
+        crop_box: tuple of (x1, y1, x2, y2) to crop the mask before uploading
     
     Returns:
         str: S3 URL of the uploaded mask, or None if upload failed
@@ -335,18 +493,34 @@ def upload_mask_to_s3(mask_array, original_image_size=None):
         return None
     
     try:
-        # Convert mask to PIL Image
-        # Ensure mask is boolean/binary
+        s3_upload_start_time = time.time()
+        
+        # Optimize mask processing pipeline for performance
+        # Direct binary conversion - ensure mask is boolean/binary
         mask_binary = (mask_array > 0).astype(np.uint8) * 255
-        mask_image = Image.fromarray(mask_binary, mode='L')
         
-        # Resize to original image size if provided
-        if original_image_size:
-            mask_image = mask_image.resize(original_image_size, Image.NEAREST)
+        # Handle cropping on numpy array first (faster than PIL operations)
+        if crop_box:
+            x1, y1, x2, y2 = crop_box
+            h, w = mask_binary.shape
+            # Ensure coordinates are within bounds
+            x1 = max(0, min(x1, w))
+            y1 = max(0, min(y1, h))
+            x2 = max(x1, min(x2, w))
+            y2 = max(y1, min(y2, h))
+            mask_binary = mask_binary[y1:y2, x1:x2]
         
-        # Convert to PNG bytes
+        # Convert directly to 1-bit PIL Image (fix deprecation warning)
+        mask_image = Image.fromarray(mask_binary).convert('1')
+        
+        # Resize if needed (after cropping for better performance)
+        if original_image_size and crop_box is None:  # Only resize if not cropped
+            mask_image = mask_image.resize(original_image_size, Image.Resampling.NEAREST)
+        
+        # Convert to PNG bytes with optimized compression settings
         buffer = io.BytesIO()
-        mask_image.save(buffer, format='PNG')
+        # Use faster compression settings - disable optimization for speed
+        mask_image.save(buffer, format='PNG', optimize=False, compress_level=1)
         buffer.seek(0)
         
         # Generate unique filename with sam2-api-masks path
@@ -354,20 +528,24 @@ def upload_mask_to_s3(mask_array, original_image_size=None):
         unique_id = str(uuid.uuid4())[:8]
         filename = f"sam2-api-masks/{timestamp}_{unique_id}.png"
         
-        # Upload to S3
+        # Upload to S3 with optimized settings
         s3_client.upload_fileobj(
             buffer,
             S3_BUCKET_NAME,
             filename,
             ExtraArgs={
                 'ContentType': 'image/png',
-                'ACL': 'public-read'  # Make the file publicly accessible
+                'ACL': 'public-read',  # Make the file publicly accessible
+                'StorageClass': 'STANDARD'  # Use standard storage for faster access
             }
         )
+        s3_upload_end_time = time.time()
+        s3_upload_duration = s3_upload_end_time - s3_upload_start_time
         
         # Generate public URL
         s3_url = f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{filename}"
-        print(f"✅ Mask uploaded to S3: {s3_url}")
+        print(f"✅ Mask uploaded to S3 (optimized 1-bit PNG): {s3_url}")
+        print(f"⏱️  S3 upload took {s3_upload_duration:.3f} seconds")
         return s3_url
         
     except ClientError as e:
@@ -377,13 +555,95 @@ def upload_mask_to_s3(mask_array, original_image_size=None):
         print(f"❌ Error uploading mask to S3: {e}")
         return None
 
-def segment_image(image_b64=None, image_url=None, point=None, box=None, points=None, boxes=None):
+def upload_mask_to_s3_async(mask_array, original_image_size=None, crop_box=None):
+    """
+    Asynchronous version of upload_mask_to_s3 for use in ThreadPoolExecutor.
+    Returns a future that can be used to get the result when ready.
+    
+    Args:
+        mask_array: numpy array of the segmentation mask
+        original_image_size: tuple of (width, height) for resizing mask
+        crop_box: tuple of (x1, y1, x2, y2) to crop the mask before uploading
+    
+    Returns:
+        str: S3 URL of the uploaded mask, or None if upload failed
+    """
+    # This is the same implementation as upload_mask_to_s3 but designed for async execution
+    return upload_mask_to_s3(mask_array, original_image_size, crop_box)
+
+def segment_selfie_multiclass(image_b64=None, image_url=None, image_pil=None):
+    """
+    Segment a selfie image using MediaPipe's multiclass selfie segmenter.
+    
+    Args:
+        image_b64: Base64 encoded image
+        image_url: URL to image
+        image_pil: PIL Image object (takes precedence over image_b64 and image_url)
+        
+    Returns:
+        dict: Contains the segmentation mask with multiple classes:
+            - 0: background
+            - 1: person (hair, body-skin, face-skin, clothes)
+            - 2: hair
+            - 3: body-skin
+            - 4: face-skin  
+            - 5: clothes
+    """
+    # Load image from either source
+    if image_pil is not None:
+        image = image_pil
+    else:
+        image = load_image_from_source(image_b64, image_url)
+    
+    # Convert PIL image to numpy array
+    image_np = np.array(image)
+    
+    # Initialize MediaPipe selfie segmenter
+    mp_selfie_segmentation = mp.solutions.selfie_segmentation
+    
+    # Create the segmenter with multiclass model
+    with mp_selfie_segmentation.SelfieSegmentation(model_selection=1) as selfie_segmentation:
+        # Process the image
+        results = selfie_segmentation.process(image_np)
+        
+        # Get segmentation mask (values 0-5 for different classes)
+        segmentation_mask = results.segmentation_mask
+        
+        # Convert to proper data type and scale
+        if segmentation_mask is not None:
+            # MediaPipe returns float values, convert to integer classes
+            segmentation_mask = (segmentation_mask * 255).astype(np.uint8)
+            
+            return {
+                "mask": segmentation_mask.tolist(),
+                "width": segmentation_mask.shape[1], 
+                "height": segmentation_mask.shape[0],
+                "classes": {
+                    0: "background",
+                    1: "person",
+                    2: "hair", 
+                    3: "body-skin",
+                    4: "face-skin",
+                    5: "clothes"
+                }
+            }
+        else:
+            raise ValueError("Failed to generate segmentation mask")
+
+def segment_image(image_b64=None, image_url=None, image_pil=None, point=None, box=None, points=None, boxes=None, crop_to_box=False):
     """
     Segment an image from base64 input or URL with optional prompts.
     Similar to the RunPod example function but with prompt support.
+    
+    Args:
+        image_pil: PIL Image object (takes precedence over image_b64 and image_url)
+        crop_to_box: If True and a box is provided, only upload the cropped mask region to S3
     """
     # Load image from either source
-    image = load_image_from_source(image_b64, image_url)
+    if image_pil is not None:
+        image = image_pil
+    else:
+        image = load_image_from_source(image_b64, image_url)
     
     # Convert to numpy array
     image_array = np.array(image)
@@ -398,26 +658,26 @@ def segment_image(image_b64=None, image_url=None, point=None, box=None, points=N
     
     # Handle single point
     if point:
-        input_points = np.array([[point.x, point.y]])
-        input_labels = np.array([point.label])
+        input_points = np.array([[point.x, point.y]], dtype=np.float32)
+        input_labels = np.array([point.label], dtype=np.int32)
     
     # Handle multiple points (takes precedence over single point)
     if points:
-        input_points = np.array([[p.x, p.y] for p in points])
-        input_labels = np.array([p.label for p in points])
-    
+        input_points = np.array([[p.x, p.y] for p in points], dtype=np.float32)
+        input_labels = np.array([p.label for p in points], dtype=np.int32)
+
     # Handle single box
     if box:
-        input_boxes = np.array([[box.x1, box.y1, box.x2, box.y2]])
-    
+        input_boxes = np.array([[box.x1, box.y1, box.x2, box.y2]], dtype=np.float32)
+
     # Handle multiple boxes (takes precedence over single box)
     if boxes:
-        input_boxes = np.array([[b.x1, b.y1, b.x2, b.y2] for b in boxes])
-    
+        input_boxes = np.array([[b.x1, b.y1, b.x2, b.y2] for b in boxes], dtype=np.float32)
+
     # If no prompts provided, use center point as default
     if input_points is None and input_boxes is None:
         height, width = image_array.shape[:2]
-        input_points = np.array([[width // 2, height // 2]])
+        input_points = np.array([[width // 2, height // 2]], dtype=np.float32)
         input_labels = np.array([1])  # foreground
     
     # Run inference
@@ -442,7 +702,11 @@ def segment_image(image_b64=None, image_url=None, point=None, box=None, points=N
         mask_array = mask
     
     # Upload mask to S3
-    mask_url = upload_mask_to_s3(mask_array, image.size)
+    crop_box = None
+    if crop_to_box and box:
+        crop_box = (int(box.x1), int(box.y1), int(box.x2), int(box.y2))
+    
+    mask_url = upload_mask_to_s3(mask_array, image.size, crop_box=crop_box)
     
     return mask_url
 
@@ -623,6 +887,9 @@ async def detect_objects_endpoint(request: ObjectDetectionRequest):
     For RES tasks, also returns segmentation polygons.
     Note: Florence-2 doesn't provide confidence scores, so confidence will be None.
     """
+    # Start timing the entire endpoint processing
+    endpoint_start_time = time.time()
+    
     try:
         # Validate input
         if not request.image_b64 and not request.imageUrl:
@@ -645,10 +912,17 @@ async def detect_objects_endpoint(request: ObjectDetectionRequest):
             DetectedObject(
                 label=obj['label'],
                 bbox=obj['bbox'],
-                confidence=obj['confidence']
+                confidence=obj['confidence'],
+                multiclasses=obj.get('multiclasses'),
+                segment_mask=obj.get('segment_mask')
             )
             for obj in result['objects']
         ]
+        
+        # Calculate total endpoint processing time
+        endpoint_end_time = time.time()
+        endpoint_duration = endpoint_end_time - endpoint_start_time
+        print(f"🏁 Total endpoint processing took {endpoint_duration:.3f} seconds")
         
         return ObjectDetectionResponse(
             objects=objects,
@@ -727,7 +1001,7 @@ async def health_check():
             "sam2": "SAM2.1 Large (Segmentation)",
             "evf_sam2": "EVF-SAM2 (Text-prompted Segmentation)",
             "birefnet": "BiRefNet (Background Removal)",
-            "florence2": "Florence-2-large (Object Detection)"
+            "florence2": "Florence-2-large (Object Detection + Integrated Selfie Segmentation)"
         }
     }
 

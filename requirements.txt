@@ -17,6 +17,7 @@ torchaudio>=2.0.0
 # Image processing
 Pillow>=9.0.0
 opencv-python>=4.5.0
+mediapipe>=0.10.0
 
 # Core scientific computing
 numpy>=1.21.0
