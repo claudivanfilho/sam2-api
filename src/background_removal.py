@@ -1,0 +1,83 @@
+"""
+Background removal functionality using BiRefNet.
+Provides high-quality background removal with transparent output.
+"""
+
+import torch
+import numpy as np
+from torchvision import transforms
+import io
+import base64
+from PIL import Image
+from .model_manager import get_model_manager
+from .utils import load_image_from_source
+
+class BackgroundRemover:
+    """Handles background removal using BiRefNet model."""
+    
+    def __init__(self):
+        self.model_manager = get_model_manager()
+    
+    def remove_background(self, image_b64=None, image_url=None, image_pil=None, return_mask=False):
+        """
+        Remove background from image using BiRefNet.
+        
+        Args:
+            image_b64: Base64 encoded image
+            image_url: URL to image
+            image_pil: PIL Image object (takes precedence)
+            return_mask: Whether to also return the segmentation mask
+            
+        Returns:
+            dict: Contains 'image_b64' with transparent background, 
+                 optionally 'mask_b64' if return_mask=True
+        """
+        # Get model and transform (will load if needed)
+        model = self.model_manager.get_model('birefnet')
+        transform = self.model_manager.get_transform('birefnet')
+        device = self.model_manager.get_device()
+        
+        # Load image from source
+        if image_pil is not None:
+            image = image_pil
+        else:
+            image = load_image_from_source(image_b64, image_url)
+        
+        original_size = image.size
+        
+        # Preprocess image for BiRefNet
+        input_images = transform(image).unsqueeze(0).to(device)
+        if device == 'cuda':
+            input_images = input_images.half()
+        
+        # BiRefNet inference
+        with torch.no_grad():
+            preds = model(input_images)[-1].sigmoid().cpu()
+        
+        # Process prediction
+        pred = preds[0].squeeze()
+        pred_pil = transforms.ToPILImage()(pred)
+        mask = pred_pil.resize(original_size)
+        
+        # Create RGBA image with transparent background
+        image_rgba = image.copy()
+        image_rgba.putalpha(mask)
+        
+        # Convert result to base64
+        buffer = io.BytesIO()
+        image_rgba.save(buffer, format="PNG")
+        image_b64_result = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        
+        result = {"image_b64": image_b64_result}
+        
+        # If mask is requested, return the mask
+        if return_mask:
+            mask_buffer = io.BytesIO()
+            mask.save(mask_buffer, format="PNG")
+            mask_b64 = base64.b64encode(mask_buffer.getvalue()).decode('utf-8')
+            result["mask_b64"] = mask_b64
+        
+        return result
+
+# Create global instance without initializing models
+background_remover = BackgroundRemover()
