@@ -105,16 +105,17 @@ class SAM2Segmenter:
         
         return mask_url
     
-    def segment_with_box(self, image_array, bbox):
+    def segment_with_box(self, image_array, bbox, point_prompt=None):
         """
         Segment using a bounding box (used by object detection).
         
         Args:
             image_array: Preprocessed numpy array (already set in predictor)
             bbox: Bounding box coordinates [x1, y1, x2, y2]
+            point_prompt: Optional point coordinates [x, y] to add as additional prompt
             
         Returns:
-            tuple: (mask_array, mask_url) 
+            numpy.ndarray: mask_array 
         """
         # Get predictor (will load if needed)
         predictor = self.model_manager.get_model('sam2_predictor')
@@ -122,11 +123,18 @@ class SAM2Segmenter:
         # Prepare box input for SAM2
         input_boxes = np.array([bbox], dtype=np.float32)
         
+        # Prepare point input if provided
+        input_points = None
+        input_labels = None
+        if point_prompt:
+            input_points = np.array([point_prompt], dtype=np.float32)
+            input_labels = np.array([1], dtype=np.int32)  # foreground point
+        
         # Run inference directly without set_image (image already preprocessed)
         with torch.no_grad():
             masks, scores, logits = predictor.predict(
-                point_coords=None,
-                point_labels=None,
+                point_coords=input_points,
+                point_labels=input_labels,
                 box=input_boxes,
                 multimask_output=False
             )
