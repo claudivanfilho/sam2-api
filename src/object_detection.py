@@ -225,9 +225,12 @@ class ObjectDetector:
             # Get mask array from SAM2 segmenter with box and point prompts
             mask_array = sam2_segmenter.segment_with_box(image_array, [x1, y1, x2, y2], point_prompt=point_prompt)
             
-            # Process mask and upload to S3
+            # Remove small fragments from SAM2 mask, keeping only the largest component
+            mask_array_cleaned = self._remove_small_fragments(mask_array.astype(np.uint8) * 255)
+            
+            # Process cleaned mask and upload to S3
             crop_box = (x1, y1, x2, y2)
-            segment_mask_url = upload_mask_to_s3(mask_array, original_image.size, crop_box=crop_box)
+            segment_mask_url = upload_mask_to_s3(mask_array_cleaned, original_image.size, crop_box=crop_box)
             
             sam2_end_time = time.time()
             sam2_duration = sam2_end_time - sam2_start_time
@@ -325,7 +328,7 @@ class ObjectDetector:
                         # Reprocess the masks with the refined segmentation
                         # Still need SAM2 intersection but with adjusted coordinates for refined crop
                         processed_classes = self._process_refined_multiclass_masks(
-                            refined_selfie_result, refined_cropped_image, mask_array, x1, y1, x2, y2, original_image, face_landmark_result
+                            refined_selfie_result, refined_cropped_image, mask_array_cleaned, x1, y1, x2, y2, original_image, face_landmark_result
                         )
                         
                         if processed_classes:
@@ -455,15 +458,18 @@ class ObjectDetector:
             # Fill convex polygon
             cv2.fillConvexPoly(mask, hull, 255)
             
-            # Upload mask to S3
-            mask_url = upload_mask_to_s3(mask, image_size, s3_path="face_landmarks")
+            # Remove small fragments from the face landmark mask
+            mask_cleaned = self._remove_small_fragments(mask)
             
-            print(f"✅ Created face landmark mask from {len(points)} landmarks")
+            # Upload cleaned mask to S3
+            mask_url = upload_mask_to_s3(mask_cleaned, image_size, s3_path="face_landmarks")
             
-            # Return both URL and mask array
+            print(f"✅ Created and cleaned face landmark mask from {len(points)} landmarks")
+            
+            # Return both URL and cleaned mask array
             return {
                 'url': mask_url,
-                'mask': mask
+                'mask': mask_cleaned
             }
             
         except Exception as e:
@@ -520,17 +526,11 @@ class ObjectDetector:
             masks_to_upload = []
             class_names = []
             
-            # Hair class (1)
+            # Hair class (1) - compute for head_mask but don't upload separately
             hair_mask = (refined_selfie_mask == 1) & sam2_mask_refined_resized
-            if np.any(hair_mask):
-                masks_to_upload.append(hair_mask.astype(np.uint8) * 255)
-                class_names.append('hair')
             
-            # Face-skin class (3)  
+            # Face-skin class (3) - compute for head_mask but don't upload separately
             face_skin_mask = (refined_selfie_mask == 3) & sam2_mask_refined_resized
-            if np.any(face_skin_mask):
-                masks_to_upload.append(face_skin_mask.astype(np.uint8) * 255)
-                class_names.append('face_skin')
             
             # Others class (5) - but only above the bottommost face_skin pixel
             others_mask_full = (refined_selfie_mask == 5) & sam2_mask_refined_resized
@@ -583,16 +583,19 @@ class ObjectDetector:
                 # Union all components to create head_mask
                 head_mask = np.logical_or.reduce(head_mask_components)
                 if np.any(head_mask):
-                    masks_to_upload.append(head_mask.astype(np.uint8) * 255)
-                    class_names.append('head_mask')
-                    print(f"✅ Created head_mask from {len(head_mask_components)} components")
+                    # Remove small fragments from head_mask
+                    head_mask_cleaned = self._remove_small_fragments(head_mask.astype(np.uint8) * 255)
+                    if np.any(head_mask_cleaned):
+                        masks_to_upload.append(head_mask_cleaned)
+                        class_names.append('head_mask')
+                        print(f"✅ Created and cleaned head_mask from {len(head_mask_components)} components")
             
             # Batch upload all refined masks to S3 in parallel
             if masks_to_upload:
                 mask_size = (refined_selfie_mask.shape[1], refined_selfie_mask.shape[0])  # (width, height)
                 
                 # Use ThreadPoolExecutor for parallel S3 uploads
-                with ThreadPoolExecutor(max_workers=4) as upload_executor:
+                with ThreadPoolExecutor(max_workers=3) as upload_executor:
                     upload_futures = {
                         upload_executor.submit(upload_mask_to_s3, mask, mask_size, s3_path="body_parts_refined"): class_name
                         for mask, class_name in zip(masks_to_upload, class_names)
@@ -761,6 +764,50 @@ class ObjectDetector:
         except Exception as e:
             print(f"⚠️  Failed to expand contour points: {e}")
             return originalPoints
+    
+    def _remove_small_fragments(self, mask):
+        """
+        Keep only the largest connected component from a binary mask.
+        
+        Args:
+            mask: Binary mask (numpy array) with values 0 or 255
+            
+        Returns:
+            numpy array: Cleaned mask with only the largest component
+        """
+        try:
+            # Convert to binary if needed
+            binary_mask = (mask > 127).astype(np.uint8)
+            
+            # Find connected components
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_mask, connectivity=8)
+            
+            # Create output mask
+            cleaned_mask = np.zeros_like(binary_mask, dtype=np.uint8)
+            
+            if num_labels <= 1:  # Only background, no components found
+                print(f"⚠️  No connected components found")
+                return cleaned_mask
+            
+            # Find the largest component (skip background label 0)
+            largest_component_idx = 0
+            largest_area = 0
+            
+            for i in range(1, num_labels):
+                area = stats[i, cv2.CC_STAT_AREA]
+                if area > largest_area:
+                    largest_area = area
+                    largest_component_idx = i
+            
+            # Keep only the largest component
+            cleaned_mask[labels == largest_component_idx] = 255
+            removed_components = num_labels - 2  # Total components minus background and kept component
+            print(f"✅ Kept largest component ({largest_area}px), removed {removed_components} smaller fragments")
+            return cleaned_mask
+                
+        except Exception as e:
+            print(f"⚠️  Failed to remove fragments: {e}")
+            return mask
 
 # Create global instance without initializing models
 object_detector = ObjectDetector()
