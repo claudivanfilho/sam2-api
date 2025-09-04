@@ -243,92 +243,104 @@ class ObjectDetector:
                 selfie_duration = selfie_end_time - selfie_start_time
                 print(f"⏱️  MediaPipe selfie segmentation took {selfie_duration:.3f} seconds for {label}")
                 
-                # Process only hair, face-skin, and items classes, intersected with SAM2 mask
-                if selfie_result and 'mask' in selfie_result:
-                    # Initialize processed_classes as empty
-                    processed_classes = {}
+                # Get the refined crop based on hair and face_skin regions
+                refined_crop_info = self._get_refined_crop_from_masks(
+                    selfie_result, cropped_object
+                )
+
+                landmarks_image = cropped_object  # Default to original crop
+                refined_selfie_result = None  # Initialize for face landmark processing
+                
+                if refined_crop_info and refined_crop_info['image']:
+                    landmarks_image = refined_crop_info['image']
+                    print(f"🎯 Using refined crop for face landmarks: {landmarks_image.size}")
                     
-                    # Get the refined crop based on hair and face_skin regions
-                    refined_crop_info = self._get_refined_crop_from_masks(
-                        selfie_result, cropped_object
+                    # Run MediaPipe segmentation on the refined crop early for face landmark processing
+                    refined_selfie_result = mediapipe_processor.segment_selfie_multiclass(
+                        image_pil=landmarks_image
+                    )
+
+                landmarks_start_time = time.time()
+                # Run face landmark detection - use refined crop if available, otherwise use original crop
+                landmarks_result = mediapipe_processor.detect_face_landmarks(image_pil=landmarks_image)
+                landmarks_end_time = time.time()
+                landmarks_duration = landmarks_end_time - landmarks_start_time
+                print(f"⏱️  MediaPipe face landmarks took {landmarks_duration:.3f} seconds for {label}")
+                obj['face_landmarks'] = landmarks_result
+                
+                # Create face landmark mask if landmarks were detected
+                face_landmark_result = None
+                if landmarks_result and 'landmarks' in landmarks_result:
+                    face_mask_start_time = time.time()
+                    
+                    # Get face skin mask from refined_selfie_result (if available) or original selfie_result
+                    face_skin_mask = None
+                    segmentation_result = refined_selfie_result if refined_selfie_result else selfie_result
+                    
+                    if segmentation_result and 'mask' in segmentation_result:
+                        selfie_mask = np.array(segmentation_result['mask'], dtype=np.uint8)
+                        # Extract face skin mask (class 3) from selfie segmentation
+                        face_skin_mask = (selfie_mask == 3).astype(np.uint8)
+                        source_type = "refined selfie" if refined_selfie_result else "original selfie"
+                        print(f"🎯 Extracted face skin mask from {source_type} result: {face_skin_mask.shape}")
+                    
+                    # Expand face landmark points using the expandContourPoints function
+                    original_landmarks = landmarks_result['landmarks'][0]
+                    print(f"🔄 Expanding {len(original_landmarks)} face landmark points")
+                    
+                    expanded_landmarks = self.expandContourPoints(
+                        originalPoints=original_landmarks,
+                        faceSkinMask=face_skin_mask,
+                        image_size=landmarks_image.size
                     )
                     
-                    refined_crop_start_time = time.time()
-                    if refined_crop_info and refined_crop_info['image']:
-                        refined_cropped_image = refined_crop_info['image']
-                        print(f"🔄 Reprocessing with refined crop: {refined_cropped_image.size}")
-                        
-                        # Run MediaPipe segmentation again on the refined crop
+                    # Create face landmark mask using expanded points
+                    face_landmark_result = self._create_face_landmark_mask(
+                        expanded_landmarks, landmarks_image.size
+                    )
+                    if face_landmark_result:
+                        if 'multiclasses' not in obj or obj['multiclasses'] is None:
+                            obj['multiclasses'] = {}
+                        obj['multiclasses']['face_landmark_mask'] = face_landmark_result['url']
+                    
+                    face_mask_end_time = time.time()
+                    face_mask_duration = face_mask_end_time - face_mask_start_time
+                    print(f"⏱️  Face landmark mask creation (with expansion) took {face_mask_duration:.3f} seconds for {label}")
+                
+                # Initialize processed_classes as empty
+                processed_classes = {}
+                refined_crop_start_time = time.time()
+
+                if refined_crop_info and refined_crop_info['image']:
+                    refined_cropped_image = refined_crop_info['image']
+                    print(f"🔄 Reprocessing with refined crop: {refined_cropped_image.size}")
+                    
+                    # Use the already computed refined_selfie_result if available, otherwise compute it
+                    if not refined_selfie_result:
                         refined_selfie_result = mediapipe_processor.segment_selfie_multiclass(
                             image_pil=refined_cropped_image
                         )
-                        
-                        if refined_selfie_result and 'mask' in refined_selfie_result:
-                            # Reprocess the masks with the refined segmentation
-                            # Still need SAM2 intersection but with adjusted coordinates for refined crop
-                            processed_classes = self._process_refined_multiclass_masks(
-                                refined_selfie_result, refined_cropped_image, mask_array, x1, y1, x2, y2, original_image
-                            )
-                            
-                            if processed_classes:
-                                refined_crop_end_time = time.time()
-                                refined_crop_duration = refined_crop_end_time - refined_crop_start_time
-                                print(f"🚀 Refined crop reprocessing took {refined_crop_duration:.3f} seconds")
-                                print(f"✅ Refined masks created: {list(processed_classes.keys())}")
                     
-                    if processed_classes:
-                        obj['multiclasses'] = processed_classes
-                    
-                    # Run face landmark detection - use refined crop if available, otherwise use original crop
-                    landmarks_image = cropped_object  # Default to original crop
-                    if refined_crop_info and refined_crop_info['image']:
-                        landmarks_image = refined_crop_info['image']
-                        print(f"🎯 Using refined crop for face landmarks: {landmarks_image.size}")
-                    
-                    landmarks_start_time = time.time()
-                    landmarks_result = mediapipe_processor.detect_face_landmarks(image_pil=landmarks_image)
-                    landmarks_end_time = time.time()
-                    landmarks_duration = landmarks_end_time - landmarks_start_time
-                    print(f"⏱️  MediaPipe face landmarks took {landmarks_duration:.3f} seconds for {label}")
-                    obj['face_landmarks'] = landmarks_result
-                    
-                    # Create face landmark mask if landmarks were detected
-                    if landmarks_result and 'landmarks' in landmarks_result:
-                        face_mask_start_time = time.time()
-                        face_landmark_mask_url = self._create_face_landmark_mask(
-                            landmarks_result['landmarks'][0], landmarks_image.size
+                    if refined_selfie_result and 'mask' in refined_selfie_result:
+                        # Reprocess the masks with the refined segmentation
+                        # Still need SAM2 intersection but with adjusted coordinates for refined crop
+                        processed_classes = self._process_refined_multiclass_masks(
+                            refined_selfie_result, refined_cropped_image, mask_array, x1, y1, x2, y2, original_image, face_landmark_result
                         )
-                        if face_landmark_mask_url:
-                            if 'multiclasses' not in obj or obj['multiclasses'] is None:
-                                obj['multiclasses'] = {}
-                            obj['multiclasses']['face_landmark_mask'] = face_landmark_mask_url
                         
-                        face_mask_end_time = time.time()
-                        face_mask_duration = face_mask_end_time - face_mask_start_time
-                        print(f"⏱️  Face landmark mask creation took {face_mask_duration:.3f} seconds for {label}")
-                else:
-                    # Run face landmark detection on the cropped person (fallback when no selfie segmentation)
-                    landmarks_start_time = time.time()
-                    landmarks_result = mediapipe_processor.detect_face_landmarks(image_pil=cropped_object)
-                    landmarks_end_time = time.time()
-                    landmarks_duration = landmarks_end_time - landmarks_start_time
-                    print(f"⏱️  MediaPipe face landmarks took {landmarks_duration:.3f} seconds for {label}")
-                    obj['face_landmarks'] = landmarks_result
-                    
-                    # Create face landmark mask if landmarks were detected
-                    if landmarks_result and 'landmarks' in landmarks_result:
-                        face_mask_start_time = time.time()
-                        face_landmark_mask_url = self._create_face_landmark_mask(
-                            landmarks_result['landmarks'][0], cropped_object.size
-                        )
-                        if face_landmark_mask_url:
-                            if 'multiclasses' not in obj or obj['multiclasses'] is None:
-                                obj['multiclasses'] = {}
-                            obj['multiclasses']['face_landmark_mask'] = face_landmark_mask_url
-                        
-                        face_mask_end_time = time.time()
-                        face_mask_duration = face_mask_end_time - face_mask_start_time
-                        print(f"⏱️  Face landmark mask creation took {face_mask_duration:.3f} seconds for {label}")
+                        if processed_classes:
+                            refined_crop_end_time = time.time()
+                            refined_crop_duration = refined_crop_end_time - refined_crop_start_time
+                            print(f"🚀 Refined crop reprocessing took {refined_crop_duration:.3f} seconds")
+                            print(f"✅ Refined masks created: {list(processed_classes.keys())}")
+                
+                if processed_classes:
+                    # Merge processed_classes with existing multiclasses to preserve face_landmark_mask
+                    if 'multiclasses' not in obj or obj['multiclasses'] is None:
+                        obj['multiclasses'] = {}
+                    obj['multiclasses'].update(processed_classes)
+                    print(f"🔄 Merged refined masks with existing multiclasses: {list(obj['multiclasses'].keys())}")
+                
                 
         except Exception as e:
             print(f"⚠️  Failed to process object {label}: {e}")
@@ -407,7 +419,7 @@ class ObjectDetector:
             image_size: Tuple of (width, height) for the image
             
         Returns:
-            str: S3 URL of the uploaded face landmark mask, or None if failed
+            dict: Contains 'url' (S3 URL) and 'mask' (numpy array), or None if failed
         """
         try:
             if not face_landmarks or len(face_landmarks) < 3:
@@ -447,13 +459,18 @@ class ObjectDetector:
             mask_url = upload_mask_to_s3(mask, image_size, s3_path="face_landmarks")
             
             print(f"✅ Created face landmark mask from {len(points)} landmarks")
-            return mask_url
+            
+            # Return both URL and mask array
+            return {
+                'url': mask_url,
+                'mask': mask
+            }
             
         except Exception as e:
             print(f"⚠️  Failed to create face landmark mask: {e}")
             return None
     
-    def _process_refined_multiclass_masks(self, refined_selfie_result, refined_cropped_image, mask_array, x1, y1, x2, y2, original_image):
+    def _process_refined_multiclass_masks(self, refined_selfie_result, refined_cropped_image, mask_array, x1, y1, x2, y2, original_image, face_landmark_result=None):
         """
         Process refined selfie segmentation masks with SAM2 intersection.
         Only processes hair, face_skin, and others categories from the refined crop.
@@ -465,6 +482,7 @@ class ObjectDetector:
             mask_array: SAM2 mask array (full image dimensions)
             x1, y1, x2, y2: Original bounding box coordinates
             original_image: PIL Image object for sizing
+            face_landmark_result: Dict containing face landmark mask data {'url': str, 'mask': np.array}
             
         Returns:
             dict: Dictionary of class names to S3 URLs, or None if no valid masks
@@ -531,7 +549,7 @@ class ObjectDetector:
                 masks_to_upload.append(others_mask.astype(np.uint8) * 255)
                 class_names.append('others')
             
-            # Create head_mask as union of intersected hair, face_skin, and limited others
+            # Create head_mask as union of intersected hair, face_skin, limited others, and face landmark mask
             head_mask_components = []
             if np.any(hair_mask):
                 head_mask_components.append(hair_mask)
@@ -539,6 +557,27 @@ class ObjectDetector:
                 head_mask_components.append(face_skin_mask)
             if np.any(others_mask):
                 head_mask_components.append(others_mask)
+            
+            # Add face landmark mask if available
+            face_landmark_mask_resized = None
+            if face_landmark_result and 'mask' in face_landmark_result:
+                face_landmark_mask = face_landmark_result['mask']
+                # Resize face landmark mask to match refined selfie mask dimensions if needed
+                if face_landmark_mask.shape != refined_selfie_mask.shape:
+                    from PIL import Image
+                    print(f"🔄 Resizing face landmark mask from {face_landmark_mask.shape} to {refined_selfie_mask.shape}")
+                    landmark_mask_pil = Image.fromarray(face_landmark_mask)
+                    landmark_mask_pil = landmark_mask_pil.resize((refined_selfie_mask.shape[1], refined_selfie_mask.shape[0]), Image.Resampling.NEAREST)
+                    face_landmark_mask_resized = np.array(landmark_mask_pil) > 0
+                else:
+                    face_landmark_mask_resized = face_landmark_mask > 0
+                
+                # Add face landmark mask as a separate uploadable mask
+                if np.any(face_landmark_mask_resized):
+                    masks_to_upload.append(face_landmark_mask_resized.astype(np.uint8) * 255)
+                    class_names.append('face_landmark_mask')
+                    head_mask_components.append(face_landmark_mask_resized)
+                    print(f"✅ Added face landmark mask to uploads and head_mask components")
             
             if head_mask_components:
                 # Union all components to create head_mask
@@ -553,7 +592,7 @@ class ObjectDetector:
                 mask_size = (refined_selfie_mask.shape[1], refined_selfie_mask.shape[0])  # (width, height)
                 
                 # Use ThreadPoolExecutor for parallel S3 uploads
-                with ThreadPoolExecutor(max_workers=3) as upload_executor:
+                with ThreadPoolExecutor(max_workers=4) as upload_executor:
                     upload_futures = {
                         upload_executor.submit(upload_mask_to_s3, mask, mask_size, s3_path="body_parts_refined"): class_name
                         for mask, class_name in zip(masks_to_upload, class_names)
@@ -578,6 +617,150 @@ class ObjectDetector:
         except Exception as e:
             print(f"⚠️  Failed to process refined multiclass masks: {e}")
             return None
+    
+    def expandContourPoints(self, originalPoints, faceSkinMask=None, image_size=None):
+        """
+        Expands face contour points outward to create a more inclusive face boundary,
+        specifically targeting the forehead area.
+        
+        Args:
+            originalPoints: List of face contour points from MediaPipe in format [[x, y, z], ...]
+                           where coordinates are normalized (0-1)
+            faceSkinMask: Face skin segmentation mask (numpy array) to constrain expansion
+            image_size: Tuple of (width, height) for the image
+            
+        Returns:
+            list: Expanded contour points in the same format as input
+        """
+        try:
+            if not originalPoints or len(originalPoints) < 3:
+                print("⚠️  Not enough original points for expansion")
+                return originalPoints
+            
+            # Forehead indices (points to be expanded)
+            FOREHEAD_INDICES = [10, 338, 297, 332, 284, 251, 389, 162, 21, 54, 103, 67, 109]
+            
+            # Convert normalized points to pixel coordinates if image_size is provided
+            if image_size:
+                width, height = image_size
+                pixel_points = []
+                for point in originalPoints:
+                    if len(point) >= 2:
+                        pixel_x = point[0] * width
+                        pixel_y = point[1] * height
+                        z = point[2] if len(point) > 2 else 0
+                        pixel_points.append([pixel_x, pixel_y, z])
+                    else:
+                        pixel_points.append(point)
+            else:
+                pixel_points = [point[:] for point in originalPoints]  # Deep copy
+            
+            # Calculate face center from all contour points
+            face_center_x = sum(point[0] for point in pixel_points) / len(pixel_points)
+            face_center_y = sum(point[1] for point in pixel_points) / len(pixel_points)
+            
+            # Calculate original face landmark bounding box
+            min_x = min(point[0] for point in pixel_points)
+            max_x = max(point[0] for point in pixel_points)
+            min_y = min(point[1] for point in pixel_points)
+            max_y = max(point[1] for point in pixel_points)
+            
+            print(f"🎯 Face center: ({face_center_x:.1f}, {face_center_y:.1f})")
+            print(f"📐 Original face bbox: ({min_x:.1f}, {min_y:.1f}) to ({max_x:.1f}, {max_y:.1f})")
+            
+            # Expand only forehead points
+            expanded_points = pixel_points[:]  # Start with copy of original points
+            
+            for i, point in enumerate(pixel_points):
+                # Only expand forehead points
+                if i not in FOREHEAD_INDICES:
+                    continue
+                
+                current_x, current_y = point[0], point[1]
+                
+                # Calculate outward direction vector from face center to current point
+                direction_x = current_x - face_center_x
+                direction_y = current_y - face_center_y
+                
+                # Normalize direction vector
+                direction_length = np.sqrt(direction_x**2 + direction_y**2)
+                if direction_length == 0:
+                    continue  # Skip if point is at face center
+                
+                direction_x /= direction_length
+                direction_y /= direction_length
+                
+                # Expand point outward in 2-pixel steps (max 80 pixels for forehead)
+                max_expansion = 80
+                step_size = 2
+                
+                new_x, new_y = current_x, current_y
+                
+                for step in range(0, max_expansion, step_size):
+                    test_x = current_x + direction_x * step
+                    test_y = current_y + direction_y * step
+                    
+                    # Convert to integer coordinates for mask checking
+                    test_x_int = int(round(test_x))
+                    test_y_int = int(round(test_y))
+                    
+                    # Check bounds
+                    if image_size:
+                        width, height = image_size
+                        if test_x_int < 0 or test_x_int >= width or test_y_int < 0 or test_y_int >= height:
+                            break
+                    
+                    # Stop expansion if X position is outside original face landmark bounding box
+                    if test_x < min_x or test_x > max_x:
+                        print(f"🛑 Point {i} stopped at X boundary: {test_x:.1f} (bbox: {min_x:.1f}-{max_x:.1f})")
+                        break
+                    
+                    # Check if expanded point goes outside the face skin mask (stop when outside face skin)
+                    if faceSkinMask is not None:
+                        if (test_y_int < faceSkinMask.shape[0] and 
+                            test_x_int < faceSkinMask.shape[1]):
+                            if faceSkinMask[test_y_int, test_x_int] == 0:
+                                print(f"🛑 Point {i} stopped outside face skin mask at ({test_x:.1f}, {test_y:.1f})")
+                                break
+                        else:
+                            # Point is outside mask dimensions, stop expansion
+                            break
+                    
+                    # Update position if we can continue
+                    new_x, new_y = test_x, test_y
+                
+                # Update the expanded point
+                if len(expanded_points[i]) > 2:
+                    expanded_points[i] = [new_x, new_y, point[2]]  # Keep original z coordinate
+                else:
+                    expanded_points[i] = [new_x, new_y]
+                
+                # Calculate expansion distance
+                expansion_distance = np.sqrt((new_x - current_x)**2 + (new_y - current_y)**2)
+                if expansion_distance > 1:  # Only log if significant expansion
+                    print(f"📏 Point {i} expanded by {expansion_distance:.1f}px: ({current_x:.1f}, {current_y:.1f}) -> ({new_x:.1f}, {new_y:.1f})")
+            
+            # Convert back to normalized coordinates if image_size was provided
+            if image_size:
+                width, height = image_size
+                normalized_points = []
+                for point in expanded_points:
+                    if len(point) >= 2:
+                        norm_x = point[0] / width
+                        norm_y = point[1] / height
+                        if len(point) > 2:
+                            normalized_points.append([norm_x, norm_y, point[2]])
+                        else:
+                            normalized_points.append([norm_x, norm_y])
+                    else:
+                        normalized_points.append(point)
+                return normalized_points
+            
+            return expanded_points
+            
+        except Exception as e:
+            print(f"⚠️  Failed to expand contour points: {e}")
+            return originalPoints
 
 # Create global instance without initializing models
 object_detector = ObjectDetector()
