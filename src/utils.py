@@ -164,3 +164,61 @@ def encode_image_to_base64(image):
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return base64.b64encode(buffer.getvalue()).decode('utf-8')
+
+def upload_image_to_s3(image_pil, s3_path="background-removed-images"):
+    """
+    Upload PIL image to S3 as PNG.
+    
+    Args:
+        image_pil: PIL Image object to upload
+        s3_path: S3 folder path (default: "background-removed-images")
+        
+    Returns:
+        str: S3 URL of uploaded image, or None if upload failed
+    """
+    if not s3_client:
+        print("⚠️  S3 client not initialized. Skipping upload.")
+        return None
+        
+    try:
+        s3_upload_start_time = datetime.now()
+        
+        # Convert PIL image to bytes
+        image_buffer = io.BytesIO()
+        image_pil.save(image_buffer, format="PNG", optimize=True)
+        image_buffer.seek(0)  # Reset buffer position to beginning
+        
+        # Generate unique filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = str(uuid.uuid4())[:8]
+        filename = f"{s3_path.strip('/')}/{timestamp}_{unique_id}.png"
+        
+        # Upload to S3
+        s3_client.upload_fileobj(
+            image_buffer,
+            S3_BUCKET_NAME,
+            filename,
+            ExtraArgs={
+                'ContentType': 'image/png',
+                'ACL': 'public-read',  # Make the file publicly accessible
+                'CacheControl': 'max-age=31536000'  # 1 year cache
+            }
+        )
+        
+        # Generate S3 URL
+        s3_url = f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{filename}"
+        
+        s3_upload_end_time = datetime.now()
+        s3_upload_duration = (s3_upload_end_time - s3_upload_start_time).total_seconds()
+        
+        print(f"✅ Background-removed image uploaded to S3: {s3_url}")
+        print(f"⏱️  S3 image upload took {s3_upload_duration:.3f} seconds")
+        
+        return s3_url
+        
+    except ClientError as e:
+        print(f"❌ Failed to upload image to S3: {e}")
+        return None
+    except Exception as e:
+        print(f"❌ Error uploading image to S3: {e}")
+        return None

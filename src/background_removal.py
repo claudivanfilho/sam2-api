@@ -29,8 +29,8 @@ class BackgroundRemover:
             return_mask: Whether to also return the segmentation mask
             
         Returns:
-            dict: Contains 'image_b64' with transparent background, 
-                 optionally 'mask_b64' if return_mask=True
+            dict: Contains 'image_pil' with transparent background, 
+                 optionally 'mask_pil' if return_mask=True
         """
         # Get model and transform (will load if needed)
         model = self.model_manager.get_model('birefnet')
@@ -63,19 +63,12 @@ class BackgroundRemover:
         image_rgba = image.copy()
         image_rgba.putalpha(mask)
         
-        # Convert result to base64
-        buffer = io.BytesIO()
-        image_rgba.save(buffer, format="PNG")
-        image_b64_result = base64.b64encode(buffer.getvalue()).decode('utf-8')
-        
-        result = {"image_b64": image_b64_result}
+        # Prepare result with PIL image
+        result = {"image_pil": image_rgba}
         
         # If mask is requested, return the mask
         if return_mask:
-            mask_buffer = io.BytesIO()
-            mask.save(mask_buffer, format="PNG")
-            mask_b64 = base64.b64encode(mask_buffer.getvalue()).decode('utf-8')
-            result["mask_b64"] = mask_b64
+            result["mask_pil"] = mask
         
         return result
 

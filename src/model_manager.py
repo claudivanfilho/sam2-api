@@ -20,12 +20,31 @@ from hydra.core.global_hydra import GlobalHydra
 class ModelManager:
     """Manages all AI models used in the API."""
     
-    def __init__(self):
+    def __init__(self, preload_models=True):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.models = {}
         self.transforms = {}
         self._initialized = set()
-        print("🚀 Model manager initialized (lazy loading enabled)")
+        
+        if preload_models:
+            print("🚀 Model manager initialized - preloading all models...")
+            self._preload_all_models()
+        else:
+            print("🚀 Model manager initialized (lazy loading enabled)")
+    
+    def _preload_all_models(self):
+        """Preload all models at initialization."""
+        models_to_load = ['sam2', 'evf_sam2', 'birefnet', 'florence2']
+        
+        for model_name in models_to_load:
+            print(f"🔄 Preloading {model_name}...")
+            try:
+                self._ensure_model_loaded(model_name)
+                print(f"✅ {model_name} loaded successfully")
+            except Exception as e:
+                print(f"❌ Failed to load {model_name}: {e}")
+        
+        print("🎉 All models preloaded successfully!")
     
     def _ensure_model_loaded(self, model_name):
         """Ensure a specific model is loaded."""
@@ -199,5 +218,5 @@ def get_model_manager():
     """Get the global model manager instance, creating it if necessary."""
     global model_manager
     if model_manager is None:
-        model_manager = ModelManager()
+        model_manager = ModelManager(preload_models=True)  # Enable preloading
     return model_manager

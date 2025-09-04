@@ -9,7 +9,7 @@ import cv2
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .model_manager import get_model_manager
-from .utils import load_image_from_source, upload_mask_to_s3
+from .utils import upload_mask_to_s3
 from .sam2_segmentation import sam2_segmenter
 from .mediapipe_operations import mediapipe_processor
 from .image_utils import get_douglas_peucker_points, remove_small_fragments
@@ -21,15 +21,14 @@ class ObjectDetector:
     def __init__(self):
         self.model_manager = get_model_manager()
     
-    def detect_objects(self, image_b64=None, image_url=None, task="<OD>", 
+    def detect_objects(self, image_pil, task="<OD>", 
                       confidence_threshold=0.3, text_input=None, return_polygon_points=False, 
                       douglas_peucker_epsilon=0.002):
         """
         Detect objects in an image using Florence-2-large model.
         
         Args:
-            image_b64: Base64 encoded image
-            image_url: URL to image
+            image_pil: PIL Image object
             task: Task prompt (default: "<OD>" for object detection)
             confidence_threshold: Minimum confidence for detections
             text_input: Text input for referring expression segmentation
@@ -45,8 +44,8 @@ class ObjectDetector:
         device = self.model_manager.get_model('florence2_device')
         dtype = self.model_manager.get_model('florence2_dtype')
         
-        # Load image from either source
-        image = load_image_from_source(image_b64, image_url)
+        # Use the provided PIL image directly
+        image = image_pil
         
         # Handle referring expression segmentation
         if task == "<REFERRING_EXPRESSION_SEGMENTATION>" and text_input:
@@ -113,6 +112,8 @@ class ObjectDetector:
             if 'bboxes' in detections and 'labels' in detections:
                 bboxes = detections['bboxes']
                 labels = detections['labels']
+                
+                print(detections, 'detectionss')
                 
                 # Define allowed object labels to keep
                 allowed_labels = [
@@ -191,9 +192,9 @@ class ObjectDetector:
         bbox_width = x2 - x1
         bbox_height = y2 - y1
         
-        # Filter out objects smaller than 300px in width or height
-        if bbox_width < 300 or bbox_height < 300:
-            print(f"⚠️  Filtering out {label}: size {bbox_width}x{bbox_height}px (< 300px)")
+        # Filter out objects smaller than 250px in width or height
+        if bbox_width < 250 and bbox_height < 250:
+            print(f"⚠️  Filtering out {label}: size {bbox_width}x{bbox_height}px (< 250)")
             return None  # Skip this object
         
         obj = {
@@ -293,11 +294,9 @@ class ObjectDetector:
                         # Extract face skin mask (class 3) from selfie segmentation
                         face_skin_mask = (selfie_mask == 3).astype(np.uint8)
                         source_type = "refined selfie" if refined_selfie_result else "original selfie"
-                        print(f"🎯 Extracted face skin mask from {source_type} result: {face_skin_mask.shape}")
                     
                     # Expand face landmark points using the expandContourPoints function
                     original_landmarks = landmarks_result['landmarks'][0]
-                    print(f"🔄 Expanding {len(original_landmarks)} face landmark points")
                     
                     expanded_landmarks = self.expandContourPoints(
                         originalPoints=original_landmarks,
@@ -326,7 +325,6 @@ class ObjectDetector:
 
                 if refined_crop_info and refined_crop_info['image']:
                     refined_cropped_image = refined_crop_info['image']
-                    print(f"🔄 Reprocessing with refined crop: {refined_cropped_image.size}")
                     
                     # Use the already computed refined_selfie_result if available, otherwise compute it
                     if not refined_selfie_result:
@@ -345,14 +343,12 @@ class ObjectDetector:
                             refined_crop_end_time = time.time()
                             refined_crop_duration = refined_crop_end_time - refined_crop_start_time
                             print(f"🚀 Refined crop reprocessing took {refined_crop_duration:.3f} seconds")
-                            print(f"✅ Refined masks created: {list(processed_classes.keys())}")
                 
                 if processed_classes:
                     # Merge processed_classes with existing multiclasses to preserve face_landmark_mask
                     if 'multiclasses' not in obj or obj['multiclasses'] is None:
                         obj['multiclasses'] = {}
                     obj['multiclasses'].update(processed_classes)
-                    print(f"🔄 Merged refined masks with existing multiclasses: {list(obj['multiclasses'].keys())}")
             
             # Check if detected object is an animal and create face mask
             animal_labels = ['dog', 'cat', 'horse']
@@ -383,7 +379,6 @@ class ObjectDetector:
                                     if 'multiclasses' not in obj or obj['multiclasses'] is None:
                                         obj['multiclasses'] = {}
                                     obj['multiclasses']['head_mask'] = polygon_points
-                                    print(f"✅ Extracted {len(polygon_points)} polygon points for {label} face mask")
                             else:
                                 # Upload mask to S3 and return URL
                                 face_mask_url = upload_mask_to_s3(animal_face_mask_cleaned, cropped_object.size, s3_path="animal_faces")
@@ -391,7 +386,6 @@ class ObjectDetector:
                                     if 'multiclasses' not in obj or obj['multiclasses'] is None:
                                         obj['multiclasses'] = {}
                                     obj['multiclasses']['head_mask'] = face_mask_url
-                                    print(f"✅ Created and uploaded {label} face mask to S3")
                         else:
                             print(f"⚠️  No valid face mask found for {label} after cleaning")
                     else:
@@ -460,10 +454,6 @@ class ObjectDetector:
             # Crop the image from top to bottom of detected regions (keep full width)
             refined_cropped = cropped_image.crop((0, refined_top, cropped_image.width, refined_bottom))
             
-            print(f"📐 Refined crop: original {cropped_image.size} -> refined {refined_cropped.size}")
-            print(f"   Y-range: {refined_top}-{refined_bottom} (hair bottom: {hair_pixels[0].max() if len(hair_pixels[0]) > 0 else 'N/A'}, face bottom: {face_skin_pixels[0].max() if len(face_skin_pixels[0]) > 0 else 'N/A'})")
-            print(f"   Final bottom Y: {bottom_y} + padding: {padding} = {refined_bottom}")
-            
             return {
                 'image': refined_cropped
             }
@@ -523,8 +513,6 @@ class ObjectDetector:
             # Remove small fragments from the face landmark mask
             mask_cleaned = remove_small_fragments(mask)
             
-            print(f"✅ Created and cleaned face landmark mask from {len(points)} landmarks")
-            
             # Return either polygon points or S3 URL based on flag
             if return_polygon_points:
                 # Extract simplified polygon points from the mask
@@ -579,18 +567,13 @@ class ObjectDetector:
             sam2_refined_end = min(original_crop_height, refined_crop_height)
             sam2_mask_refined = sam2_mask_cropped[0:sam2_refined_end, :]
             
-            print(f"🔍 Refined dimension check - Selfie mask: {refined_selfie_mask.shape}, SAM2 refined mask: {sam2_mask_refined.shape}")
-            print(f"   SAM2 region from top: 0-{sam2_refined_end}")
-            
             # Resize SAM2 mask to match refined selfie mask dimensions if needed
             if sam2_mask_refined.shape != refined_selfie_mask.shape:
                 from PIL import Image
-                print(f"🔄 Resizing SAM2 refined mask from {sam2_mask_refined.shape} to {refined_selfie_mask.shape}")
                 sam2_mask_pil = Image.fromarray((sam2_mask_refined > 0).astype(np.uint8) * 255)
                 sam2_mask_pil = sam2_mask_pil.resize((refined_selfie_mask.shape[1], refined_selfie_mask.shape[0]), Image.Resampling.NEAREST)
                 sam2_mask_refined_resized = np.array(sam2_mask_pil) > 0
             else:
-                print(f"✅ Refined dimensions match perfectly, no resizing needed")
                 sam2_mask_refined_resized = sam2_mask_refined > 0
             
             # Process specific classes with SAM2 intersection
@@ -611,7 +594,6 @@ class ObjectDetector:
             if np.any(face_skin_mask):
                 face_skin_y_coords = np.where(face_skin_mask)[0]
                 bottommost_face_skin_y = np.max(face_skin_y_coords)
-                print(f"🎯 Limiting others mask to above Y={bottommost_face_skin_y} (bottommost face_skin)")
                 
                 # Zero out all others pixels below the bottommost face_skin
                 others_mask[bottommost_face_skin_y+1:, :] = False
@@ -636,7 +618,6 @@ class ObjectDetector:
                 # Resize face landmark mask to match refined selfie mask dimensions if needed
                 if face_landmark_mask.shape != refined_selfie_mask.shape:
                     from PIL import Image
-                    print(f"🔄 Resizing face landmark mask from {face_landmark_mask.shape} to {refined_selfie_mask.shape}")
                     landmark_mask_pil = Image.fromarray(face_landmark_mask)
                     landmark_mask_pil = landmark_mask_pil.resize((refined_selfie_mask.shape[1], refined_selfie_mask.shape[0]), Image.Resampling.NEAREST)
                     face_landmark_mask_resized = np.array(landmark_mask_pil) > 0
@@ -648,7 +629,6 @@ class ObjectDetector:
                     masks_to_upload.append(face_landmark_mask_resized.astype(np.uint8) * 255)
                     class_names.append('face_landmark_mask')
                     head_mask_components.append(face_landmark_mask_resized)
-                    print(f"✅ Added face landmark mask to uploads and head_mask components")
             
             if head_mask_components:
                 # Union all components to create head_mask
@@ -659,7 +639,6 @@ class ObjectDetector:
                     if np.any(head_mask_cleaned):
                         masks_to_upload.append(head_mask_cleaned)
                         class_names.append('head_mask')
-                        print(f"✅ Created and cleaned head_mask from {len(head_mask_components)} components")
             
             # Process all refined masks based on return_polygon_points flag
             if masks_to_upload:
@@ -673,7 +652,6 @@ class ObjectDetector:
                         if polygon_points:  # Only add if we got valid points
                             processed_classes[class_name] = polygon_points
                     
-                    print(f"✅ Extracted polygon points for {len(processed_classes)} refined mask classes")
                 else:
                     # Use ThreadPoolExecutor for parallel S3 uploads
                     with ThreadPoolExecutor(max_workers=3) as upload_executor:
@@ -749,9 +727,6 @@ class ObjectDetector:
             min_y = min(point[1] for point in pixel_points)
             max_y = max(point[1] for point in pixel_points)
             
-            print(f"🎯 Face center: ({face_center_x:.1f}, {face_center_y:.1f})")
-            print(f"📐 Original face bbox: ({min_x:.1f}, {min_y:.1f}) to ({max_x:.1f}, {max_y:.1f})")
-            
             # Expand only forehead points
             expanded_points = pixel_points[:]  # Start with copy of original points
             
@@ -796,7 +771,6 @@ class ObjectDetector:
                     
                     # Stop expansion if X position is outside original face landmark bounding box
                     if test_x < min_x or test_x > max_x:
-                        print(f"🛑 Point {i} stopped at X boundary: {test_x:.1f} (bbox: {min_x:.1f}-{max_x:.1f})")
                         break
                     
                     # Check if expanded point goes outside the face skin mask (stop when outside face skin)
@@ -804,7 +778,6 @@ class ObjectDetector:
                         if (test_y_int < faceSkinMask.shape[0] and 
                             test_x_int < faceSkinMask.shape[1]):
                             if faceSkinMask[test_y_int, test_x_int] == 0:
-                                print(f"🛑 Point {i} stopped outside face skin mask at ({test_x:.1f}, {test_y:.1f})")
                                 break
                         else:
                             # Point is outside mask dimensions, stop expansion
@@ -821,8 +794,6 @@ class ObjectDetector:
                 
                 # Calculate expansion distance
                 expansion_distance = np.sqrt((new_x - current_x)**2 + (new_y - current_y)**2)
-                if expansion_distance > 1:  # Only log if significant expansion
-                    print(f"📏 Point {i} expanded by {expansion_distance:.1f}px: ({current_x:.1f}, {current_y:.1f}) -> ({new_x:.1f}, {new_y:.1f})")
             
             # Convert back to normalized coordinates if image_size was provided
             if image_size:

@@ -28,6 +28,79 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
+@app.on_event("startup")
+async def startup_event():
+    """Preload all models on application startup."""
+    print("🚀 FastAPI startup: Preloading all AI models...")
+    model_manager = get_model_manager()  # This will trigger preloading
+    print("✅ All models preloaded successfully!")
+
+def process_background_removal_and_upload(image_pil):
+    """
+    Process background removal and upload both mask and resized image to S3 in parallel.
+    
+    Args:
+        image_pil: PIL Image object
+        
+    Returns:
+        tuple: (background_removed_url, mask_url) - S3 URLs for both uploads
+    """
+    # Run background removal and get the mask for S3 upload
+    background_start_time = time.time()
+    background_result = background_remover.remove_background(
+        image_pil=image_pil,
+        return_mask=True  # We need the mask for S3 upload
+    )
+    background_end_time = time.time()
+    background_duration = background_end_time - background_start_time
+    print(f"⏱️  Background removal took {background_duration:.3f} seconds")
+    
+    # Prepare both images for parallel upload
+    from src.utils import upload_image_to_s3
+    from PIL import Image
+    import asyncio
+    import concurrent.futures
+    from functools import partial
+    
+    # Get both images
+    background_mask_pil = background_result['mask_pil']
+    background_removed_pil = background_result['image_pil']
+    
+    # Resize the background-removed image (max size 1024)
+    w, h = background_removed_pil.size
+    if max(w, h) > 1024:
+        scale = 1024 / max(w, h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        background_removed_resized = background_removed_pil.resize((new_w, new_h), Image.LANCZOS)
+    else:
+        background_removed_resized = background_removed_pil
+    
+    # Define async upload functions
+    async def upload_mask():
+        loop = asyncio.get_event_loop()
+        upload_func = partial(upload_image_to_s3, background_mask_pil, s3_path="background-removal-masks")
+        return await loop.run_in_executor(None, upload_func)
+    
+    async def upload_background_image():
+        loop = asyncio.get_event_loop()
+        upload_func = partial(upload_image_to_s3, background_removed_resized, s3_path="background-removed-images")
+        return await loop.run_in_executor(None, upload_func)
+    
+    # Run both uploads in parallel
+    async def run_parallel_uploads():
+        s3_upload_start_time = time.time()
+        mask_url, background_removed_url = await asyncio.gather(
+            upload_mask(),
+            upload_background_image()
+        )
+        s3_upload_end_time = time.time()
+        s3_upload_duration = s3_upload_end_time - s3_upload_start_time
+        print(f"⏱️  Parallel S3 uploads (mask + resized image) took {s3_upload_duration:.3f} seconds")
+        return background_removed_url, mask_url
+    
+    # Execute the parallel uploads
+    return asyncio.run(run_parallel_uploads())
+
 # Pydantic models for API requests and responses
 class Point(BaseModel):
     x: float
@@ -88,6 +161,8 @@ class ObjectDetectionResponse(BaseModel):
     objects: list[DetectedObject]
     task_used: str
     segmentation_mask: Optional[list] = None  # For RES tasks
+    background_removed_url: Optional[str] = None  # S3 URL of resized background-removed image (max 1024px)
+    background_mask_url: Optional[str] = None  # S3 URL of background removal mask
 
 # API Endpoints
 
@@ -259,15 +334,39 @@ async def detect_objects_endpoint(request: ObjectDetectionRequest):
         if request.image_b64 and request.imageUrl:
             raise HTTPException(status_code=400, detail="Provide either image_b64 OR imageUrl, not both")
         
-        # Run object detection
-        result = object_detector.detect_objects(
-            image_b64=request.image_b64,
-            image_url=request.imageUrl,
-            task=request.task,
-            confidence_threshold=request.confidence_threshold,
-            text_input=request.text_input,
-            return_polygon_points=request.return_polygon_points,
-            douglas_peucker_epsilon=request.douglas_peucker_epsilon
+        # Load image from source - moved from object_detection to main.py
+        from src.utils import load_image_from_source
+        image_pil = load_image_from_source(image_b64=request.image_b64, image_url=request.imageUrl)
+        
+        # Run background removal and object detection in parallel
+        import asyncio
+        import concurrent.futures
+        from functools import partial
+        
+        async def run_background_processing():
+            """Run background removal and upload in thread pool."""
+            loop = asyncio.get_event_loop()
+            background_func = partial(process_background_removal_and_upload, image_pil)
+            return await loop.run_in_executor(None, background_func)
+        
+        async def run_object_detection():
+            """Run object detection in thread pool."""
+            loop = asyncio.get_event_loop()
+            detection_func = partial(
+                object_detector.detect_objects,
+                image_pil=image_pil,
+                task=request.task,
+                confidence_threshold=request.confidence_threshold,
+                text_input=request.text_input,
+                return_polygon_points=request.return_polygon_points,
+                douglas_peucker_epsilon=request.douglas_peucker_epsilon
+            )
+            return await loop.run_in_executor(None, detection_func)
+        
+        # Execute both operations concurrently
+        (background_removed_url, mask_url), result = await asyncio.gather(
+            run_background_processing(),
+            run_object_detection()
         )
         
         # Convert to response format
@@ -289,7 +388,9 @@ async def detect_objects_endpoint(request: ObjectDetectionRequest):
         return ObjectDetectionResponse(
             objects=objects,
             task_used=result['task_used'],
-            segmentation_mask=result.get('segmentation_mask')
+            segmentation_mask=result.get('segmentation_mask'),
+            background_removed_url=background_removed_url,
+            background_mask_url=mask_url
         )
         
     except ValueError as e:
@@ -310,7 +411,25 @@ async def remove_background_endpoint(request: RemoveBackgroundRequest):
             return_mask=request.return_mask
         )
         
-        return RemoveBackgroundResponse(**result)
+        # Convert PIL images to base64 for API response
+        import io
+        import base64
+        
+        # Convert image_pil to base64
+        image_buffer = io.BytesIO()
+        result['image_pil'].save(image_buffer, format="PNG")
+        image_b64 = base64.b64encode(image_buffer.getvalue()).decode('utf-8')
+        
+        response_data = {"image_b64": image_b64}
+        
+        # Convert mask_pil to base64 if present
+        if 'mask_pil' in result:
+            mask_buffer = io.BytesIO()
+            result['mask_pil'].save(mask_buffer, format="PNG")
+            mask_b64 = base64.b64encode(mask_buffer.getvalue()).decode('utf-8')
+            response_data["mask_b64"] = mask_b64
+        
+        return RemoveBackgroundResponse(**response_data)
         
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -340,6 +459,11 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    model_manager = get_model_manager()
-    print(f"Starting FastAPI server with SAM2 + EVF-SAM2 on {model_manager.get_device()}")
+    
+    # Preload all models at startup
+    print("🚀 Starting FastAPI server...")
+    print("📦 Initializing and preloading all AI models...")
+    model_manager = get_model_manager()  # This will trigger preloading
+    print(f"✅ Server ready on {model_manager.get_device()}")
+    
     uvicorn.run(app, host="0.0.0.0", port=8000)
