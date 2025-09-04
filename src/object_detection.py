@@ -5,6 +5,7 @@ Handles object detection with integrated SAM2 segmentation, face landmarks, and 
 
 import torch
 import numpy as np
+import cv2
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .model_manager import get_model_manager
@@ -290,6 +291,21 @@ class ObjectDetector:
                     landmarks_duration = landmarks_end_time - landmarks_start_time
                     print(f"⏱️  MediaPipe face landmarks took {landmarks_duration:.3f} seconds for {label}")
                     obj['face_landmarks'] = landmarks_result
+                    
+                    # Create face landmark mask if landmarks were detected
+                    if landmarks_result and 'landmarks' in landmarks_result:
+                        face_mask_start_time = time.time()
+                        face_landmark_mask_url = self._create_face_landmark_mask(
+                            landmarks_result['landmarks'][0], landmarks_image.size
+                        )
+                        if face_landmark_mask_url:
+                            if 'multiclasses' not in obj or obj['multiclasses'] is None:
+                                obj['multiclasses'] = {}
+                            obj['multiclasses']['face_landmark_mask'] = face_landmark_mask_url
+                        
+                        face_mask_end_time = time.time()
+                        face_mask_duration = face_mask_end_time - face_mask_start_time
+                        print(f"⏱️  Face landmark mask creation took {face_mask_duration:.3f} seconds for {label}")
                 else:
                     # Run face landmark detection on the cropped person (fallback when no selfie segmentation)
                     landmarks_start_time = time.time()
@@ -298,6 +314,21 @@ class ObjectDetector:
                     landmarks_duration = landmarks_end_time - landmarks_start_time
                     print(f"⏱️  MediaPipe face landmarks took {landmarks_duration:.3f} seconds for {label}")
                     obj['face_landmarks'] = landmarks_result
+                    
+                    # Create face landmark mask if landmarks were detected
+                    if landmarks_result and 'landmarks' in landmarks_result:
+                        face_mask_start_time = time.time()
+                        face_landmark_mask_url = self._create_face_landmark_mask(
+                            landmarks_result['landmarks'][0], cropped_object.size
+                        )
+                        if face_landmark_mask_url:
+                            if 'multiclasses' not in obj or obj['multiclasses'] is None:
+                                obj['multiclasses'] = {}
+                            obj['multiclasses']['face_landmark_mask'] = face_landmark_mask_url
+                        
+                        face_mask_end_time = time.time()
+                        face_mask_duration = face_mask_end_time - face_mask_start_time
+                        print(f"⏱️  Face landmark mask creation took {face_mask_duration:.3f} seconds for {label}")
                 
         except Exception as e:
             print(f"⚠️  Failed to process object {label}: {e}")
@@ -364,6 +395,62 @@ class ObjectDetector:
             
         except Exception as e:
             print(f"⚠️  Failed to create refined crop: {e}")
+            return None
+    
+    def _create_face_landmark_mask(self, face_landmarks, image_size):
+        """
+        Create a face mask using convex hull of face landmarks.
+        
+        Args:
+            face_landmarks: List of landmark points in format [[x, y, z], ...]
+                           where coordinates are normalized (0-1)
+            image_size: Tuple of (width, height) for the image
+            
+        Returns:
+            str: S3 URL of the uploaded face landmark mask, or None if failed
+        """
+        try:
+            if not face_landmarks or len(face_landmarks) < 3:
+                print("⚠️  Not enough face landmarks to create convex hull")
+                return None
+            
+            # Convert normalized landmarks to pixel coordinates
+            # landmarks format: [[x, y, z], [x, y, z], ...]
+            # where x, y are normalized (0-1) and z is depth
+            width, height = image_size
+            points = []
+            
+            for landmark in face_landmarks:
+                if len(landmark) >= 2:  # Ensure we have at least x, y coordinates
+                    # Convert normalized coordinates to pixel coordinates
+                    pixel_x = int(landmark[0] * width)
+                    pixel_y = int(landmark[1] * height)
+                    points.append([pixel_x, pixel_y])
+            
+            if len(points) < 3:
+                print("⚠️  Not enough valid landmark points to create convex hull")
+                return None
+            
+            # Convert to numpy array
+            points = np.array(points, dtype=np.int32)
+            
+            # Create convex hull
+            hull = cv2.convexHull(points)
+            
+            # Create mask with image dimensions (height, width)
+            mask = np.zeros((height, width), dtype=np.uint8)
+            
+            # Fill convex polygon
+            cv2.fillConvexPoly(mask, hull, 255)
+            
+            # Upload mask to S3
+            mask_url = upload_mask_to_s3(mask, image_size, s3_path="face_landmarks")
+            
+            print(f"✅ Created face landmark mask from {len(points)} landmarks")
+            return mask_url
+            
+        except Exception as e:
+            print(f"⚠️  Failed to create face landmark mask: {e}")
             return None
     
     def _process_refined_multiclass_masks(self, refined_selfie_result, refined_cropped_image, mask_array, x1, y1, x2, y2, original_image):
