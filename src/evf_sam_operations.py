@@ -25,7 +25,18 @@ class EVFSAMSegmenter:
         """Preprocess for SAM model."""
         x = torch.from_numpy(x).permute(2,0,1).contiguous()
         x = F.interpolate(x.unsqueeze(0), (img_size, img_size), mode="bilinear", align_corners=False).squeeze(0)
-        x = (x - pixel_mean) / pixel_std
+        
+        # Get model to match dtype
+        model = self.model_manager.get_model('evf_sam2')
+        device = model.device
+        dtype = model.dtype
+        
+        # Ensure pixel_mean and pixel_std have the same dtype and device as the model
+        pixel_mean_tensor = pixel_mean.to(dtype=dtype, device=device)
+        pixel_std_tensor = pixel_std.to(dtype=dtype, device=device)
+        
+        x = x.to(dtype=dtype, device=device)
+        x = (x - pixel_mean_tensor) / pixel_std_tensor
         return x, None
 
     def beit3_preprocess(self, x: np.ndarray, img_size=224):
@@ -56,6 +67,10 @@ class EVFSAMSegmenter:
         model = self.model_manager.get_model('evf_sam2')
         tokenizer = self.model_manager.get_model('evf_tokenizer')
         
+        # Ensure model is in correct dtype state before each inference
+        # This prevents dtype corruption between calls
+        model = model.half()
+        
         # Load image from source
         if image_pil is not None:
             image = image_pil
@@ -67,29 +82,49 @@ class EVFSAMSegmenter:
         # Preprocess for EVF-SAM2
         original_size_list = [image_np.shape[:2]]
         
-        # BEIT-3 preprocessing
+        # BEIT-3 preprocessing - ensure proper dtype
         image_beit = self.beit3_preprocess(image_np, 224).to(dtype=model.dtype, device=model.device)
         
-        # SAM preprocessing  
+        # SAM preprocessing - ensure proper dtype
         image_sam, resize_shape = self.sam_preprocess(image_np, model_type="sam2")
-        image_sam = image_sam.to(dtype=model.dtype, device=model.device)
+        # image_sam is already converted to proper dtype and device in sam_preprocess
         
         # Prepare text prompt
         if semantic:
             prompt = f"[semantic] {prompt}"
             
-        # Tokenize prompt
+        # Tokenize prompt and ensure proper device placement
         input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device=model.device)
         
-        # Run inference
-        with torch.no_grad():
-            pred_mask = model.inference(
-                image_sam.unsqueeze(0),
-                image_beit.unsqueeze(0), 
-                input_ids,
-                resize_list=[resize_shape],
-                original_size_list=original_size_list,
-            )
+        # Run inference with proper dtype handling and error recovery
+        try:
+            with torch.no_grad():
+                pred_mask = model.inference(
+                    image_sam.unsqueeze(0),
+                    image_beit.unsqueeze(0),
+                    input_ids,
+                    resize_list=[resize_shape],
+                    original_size_list=original_size_list,
+                )
+        except RuntimeError as e:
+            if "dtype" in str(e).lower():
+                print(f"⚠️  Dtype error detected, attempting model reset: {e}")
+                # Force model back to half precision
+                model = model.half()
+                # Retry with fresh tensor conversions
+                image_beit = self.beit3_preprocess(image_np, 224).to(dtype=torch.half, device=model.device)
+                image_sam, resize_shape = self.sam_preprocess(image_np, model_type="sam2")
+                
+                with torch.no_grad():
+                    pred_mask = model.inference(
+                        image_sam.unsqueeze(0),
+                        image_beit.unsqueeze(0),
+                        input_ids,
+                        resize_list=[resize_shape],
+                        original_size_list=original_size_list,
+                    )
+            else:
+                raise e
             
         # Process output
         pred_mask = pred_mask.detach().cpu().numpy()[0]

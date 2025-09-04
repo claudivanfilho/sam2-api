@@ -6,7 +6,7 @@ Now imports functionality from separate modules for better organization.
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Union
 import time
 
 # Import our modular components from src package
@@ -75,14 +75,14 @@ class ObjectDetectionRequest(BaseModel):
     task: str = "<OD>"         # Task prompt (default: object detection)
     confidence_threshold: float = 0.3  # Minimum confidence for detections
     text_input: str = None     # Text input for referring expression segmentation
+    return_polygon_points: bool = False  # If True, return simplified polygon points instead of S3 URLs for masks
+    douglas_peucker_epsilon: float = 0.002  # Douglas-Peucker simplification epsilon ratio (default: 0.002 = 0.2%)
 
 class DetectedObject(BaseModel):
     label: str
     bbox: list[float]  # [x1, y1, x2, y2]
-    confidence: Optional[float] = None
-    multiclasses: Optional[dict] = None  # Selfie segmentation result for person objects
-    face_landmarks: Optional[dict] = None  # MediaPipe face landmarks for person objects
-    segment_mask: Optional[str] = None  # S3 URL of SAM2 segmentation mask for the cropped object
+    multiclasses: Optional[dict] = None  # Selfie segmentation result (URLs or polygon points) for person objects
+    segment_mask: Optional[Union[str, list[list[float]]]] = None  # S3 URL or polygon points of SAM2 segmentation mask
 
 class ObjectDetectionResponse(BaseModel):
     objects: list[DetectedObject]
@@ -223,6 +223,17 @@ async def detect_objects_endpoint(request: ObjectDetectionRequest):
       "task": "<DENSE_REGION_CAPTION>"
     }
     
+    5. Return polygon points instead of S3 URLs:
+    {
+      "image_b64": "<base64 encoded image>",
+      "return_polygon_points": true,
+      "douglas_peucker_epsilon": 0.001
+    }
+    
+    Parameters:
+    - return_polygon_points: If true, returns simplified polygon points instead of S3 URLs for masks
+    - douglas_peucker_epsilon: Controls polygon simplification (lower = more detailed, higher = simpler)
+    
     Supported tasks:
     - "<OD>": Object detection (default)
     - "<REFERRING_EXPRESSION_SEGMENTATION>": Segment objects by text description
@@ -254,7 +265,9 @@ async def detect_objects_endpoint(request: ObjectDetectionRequest):
             image_url=request.imageUrl,
             task=request.task,
             confidence_threshold=request.confidence_threshold,
-            text_input=request.text_input
+            text_input=request.text_input,
+            return_polygon_points=request.return_polygon_points,
+            douglas_peucker_epsilon=request.douglas_peucker_epsilon
         )
         
         # Convert to response format
@@ -262,9 +275,7 @@ async def detect_objects_endpoint(request: ObjectDetectionRequest):
             DetectedObject(
                 label=obj['label'],
                 bbox=obj['bbox'],
-                confidence=obj['confidence'],
                 multiclasses=obj.get('multiclasses'),
-                face_landmarks=obj.get('face_landmarks'),
                 segment_mask=obj.get('segment_mask')
             )
             for obj in result['objects']

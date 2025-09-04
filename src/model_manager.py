@@ -97,6 +97,9 @@ class ModelManager:
             del evf_model.visual_model.memory_encoder
             del evf_model.visual_model.memory_attention
             
+            # Ensure all model parameters are in half precision to avoid dtype mismatches
+            evf_model = evf_model.half()
+            
         finally:
             # Always change back to original directory
             os.chdir(original_cwd)

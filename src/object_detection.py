@@ -12,6 +12,8 @@ from .model_manager import get_model_manager
 from .utils import load_image_from_source, upload_mask_to_s3
 from .sam2_segmentation import sam2_segmenter
 from .mediapipe_operations import mediapipe_processor
+from .image_utils import get_douglas_peucker_points, remove_small_fragments
+from .evf_sam_operations import evf_sam_segmenter
 
 class ObjectDetector:
     """Handles Florence-2 object detection with integrated processing."""
@@ -20,7 +22,8 @@ class ObjectDetector:
         self.model_manager = get_model_manager()
     
     def detect_objects(self, image_b64=None, image_url=None, task="<OD>", 
-                      confidence_threshold=0.3, text_input=None):
+                      confidence_threshold=0.3, text_input=None, return_polygon_points=False, 
+                      douglas_peucker_epsilon=0.002):
         """
         Detect objects in an image using Florence-2-large model.
         
@@ -30,6 +33,8 @@ class ObjectDetector:
             task: Task prompt (default: "<OD>" for object detection)
             confidence_threshold: Minimum confidence for detections
             text_input: Text input for referring expression segmentation
+            return_polygon_points: If True, return simplified polygon points instead of S3 URLs for masks
+            douglas_peucker_epsilon: Epsilon ratio for Douglas-Peucker polygon simplification (default: 0.002)
             
         Returns:
             dict: Parsed detection results with objects and their bounding boxes
@@ -130,7 +135,7 @@ class ObjectDetector:
                 with ThreadPoolExecutor(max_workers=4) as executor:
                     # Submit all object processing tasks with preprocessed image
                     future_to_data = {
-                        executor.submit(self._process_detected_object, bbox, label, image_array, allowed_labels, person_labels, image): (bbox, label)
+                        executor.submit(self._process_detected_object, bbox, label, image_array, allowed_labels, person_labels, image, return_polygon_points, douglas_peucker_epsilon): (bbox, label)
                         for bbox, label in zip(bboxes, labels)
                     }
                     
@@ -159,7 +164,7 @@ class ObjectDetector:
             'raw_output': parsed_answer
         }
     
-    def _process_detected_object(self, bbox, label, image_array, allowed_labels, person_labels, original_image):
+    def _process_detected_object(self, bbox, label, image_array, allowed_labels, person_labels, original_image, return_polygon_points=False, douglas_peucker_epsilon=0.002):
         """
         Process a single detected object (bbox + label) with segmentation.
         This function is designed to be run in parallel for multiple objects.
@@ -171,6 +176,8 @@ class ObjectDetector:
             allowed_labels: List of allowed object labels
             person_labels: List of person-related labels for selfie segmentation
             original_image: PIL Image object for cropping
+            return_polygon_points: If True, return simplified polygon points instead of S3 URLs for masks
+            douglas_peucker_epsilon: Epsilon ratio for Douglas-Peucker polygon simplification
             
         Returns:
             dict: Processed object with segmentation results, or None if filtered out
@@ -192,7 +199,6 @@ class ObjectDetector:
         obj = {
             'label': label,
             'bbox': bbox,  # [x1, y1, x2, y2]
-            'confidence': None,  # Florence-2 doesn't return confidence scores
             'multiclasses': None,
             'face_landmarks': None,
             'segment_mask': None
@@ -226,16 +232,19 @@ class ObjectDetector:
             mask_array = sam2_segmenter.segment_with_box(image_array, [x1, y1, x2, y2], point_prompt=point_prompt)
             
             # Remove small fragments from SAM2 mask, keeping only the largest component
-            mask_array_cleaned = self._remove_small_fragments(mask_array.astype(np.uint8) * 255)
+            mask_array_cleaned = remove_small_fragments(mask_array.astype(np.uint8) * 255)
             
-            # Process cleaned mask and upload to S3
-            crop_box = (x1, y1, x2, y2)
-            segment_mask_url = upload_mask_to_s3(mask_array_cleaned, original_image.size, crop_box=crop_box)
-            
-            sam2_end_time = time.time()
-            sam2_duration = sam2_end_time - sam2_start_time
-            print(f"⏱️  SAM2 segmentation took {sam2_duration:.3f} seconds for {label}")
-            obj['segment_mask'] = segment_mask_url
+            # Process cleaned mask based on return_polygon_points flag
+            if return_polygon_points:
+                # Extract simplified polygon points from the mask
+                polygon_points = get_douglas_peucker_points(mask_array_cleaned, epsilon_ratio=douglas_peucker_epsilon)
+                obj['segment_mask'] = polygon_points
+                print(f"✅ Extracted {len(polygon_points)} simplified polygon points for {label}")
+            else:
+                # Upload mask to S3 and return URL
+                crop_box = (x1, y1, x2, y2)
+                segment_mask_url = upload_mask_to_s3(mask_array_cleaned, original_image.size, crop_box=crop_box)
+                obj['segment_mask'] = segment_mask_url
             
             # Check if detected object is a person and run selfie segmentation + face landmarks
             if any(person_word in label.lower() for person_word in person_labels):
@@ -269,7 +278,6 @@ class ObjectDetector:
                 landmarks_end_time = time.time()
                 landmarks_duration = landmarks_end_time - landmarks_start_time
                 print(f"⏱️  MediaPipe face landmarks took {landmarks_duration:.3f} seconds for {label}")
-                obj['face_landmarks'] = landmarks_result
                 
                 # Create face landmark mask if landmarks were detected
                 face_landmark_result = None
@@ -299,12 +307,14 @@ class ObjectDetector:
                     
                     # Create face landmark mask using expanded points
                     face_landmark_result = self._create_face_landmark_mask(
-                        expanded_landmarks, landmarks_image.size
+                        expanded_landmarks, landmarks_image.size, return_polygon_points, douglas_peucker_epsilon
                     )
                     if face_landmark_result:
                         if 'multiclasses' not in obj or obj['multiclasses'] is None:
                             obj['multiclasses'] = {}
-                        obj['multiclasses']['face_landmark_mask'] = face_landmark_result['url']
+                        # Use 'url' or 'points' key based on return_polygon_points flag
+                        result_key = 'points' if return_polygon_points else 'url'
+                        obj['multiclasses']['face_landmark_mask'] = face_landmark_result[result_key]
                     
                     face_mask_end_time = time.time()
                     face_mask_duration = face_mask_end_time - face_mask_start_time
@@ -328,7 +338,7 @@ class ObjectDetector:
                         # Reprocess the masks with the refined segmentation
                         # Still need SAM2 intersection but with adjusted coordinates for refined crop
                         processed_classes = self._process_refined_multiclass_masks(
-                            refined_selfie_result, refined_cropped_image, mask_array_cleaned, x1, y1, x2, y2, original_image, face_landmark_result
+                            refined_selfie_result, refined_cropped_image, mask_array_cleaned, x1, y1, x2, y2, original_image, face_landmark_result, return_polygon_points, douglas_peucker_epsilon
                         )
                         
                         if processed_classes:
@@ -343,6 +353,56 @@ class ObjectDetector:
                         obj['multiclasses'] = {}
                     obj['multiclasses'].update(processed_classes)
                     print(f"🔄 Merged refined masks with existing multiclasses: {list(obj['multiclasses'].keys())}")
+            
+            # Check if detected object is an animal and create face mask
+            animal_labels = ['dog', 'cat', 'horse']
+            if any(animal_word in label.lower() for animal_word in animal_labels):
+                animal_face_start_time = time.time()
+                
+                # Use EVF-SAM2 to segment animal face with text prompt
+                try:
+                    face_mask_result = evf_sam_segmenter.segment_with_text(
+                        image_pil=cropped_object,
+                        prompt="animal head",
+                        semantic=True
+                    )
+                    
+                    if face_mask_result:
+                        # Convert list mask to numpy array
+                        animal_face_mask = np.array(face_mask_result, dtype=np.uint8) * 255
+                        
+                        # Remove small fragments from animal face mask
+                        animal_face_mask_cleaned = remove_small_fragments(animal_face_mask)
+                        
+                        if np.any(animal_face_mask_cleaned):
+                            # Process based on return_polygon_points flag
+                            if return_polygon_points:
+                                # Extract simplified polygon points from the mask
+                                polygon_points = get_douglas_peucker_points(animal_face_mask_cleaned, epsilon_ratio=douglas_peucker_epsilon)
+                                if polygon_points:
+                                    if 'multiclasses' not in obj or obj['multiclasses'] is None:
+                                        obj['multiclasses'] = {}
+                                    obj['multiclasses']['head_mask'] = polygon_points
+                                    print(f"✅ Extracted {len(polygon_points)} polygon points for {label} face mask")
+                            else:
+                                # Upload mask to S3 and return URL
+                                face_mask_url = upload_mask_to_s3(animal_face_mask_cleaned, cropped_object.size, s3_path="animal_faces")
+                                if face_mask_url:
+                                    if 'multiclasses' not in obj or obj['multiclasses'] is None:
+                                        obj['multiclasses'] = {}
+                                    obj['multiclasses']['head_mask'] = face_mask_url
+                                    print(f"✅ Created and uploaded {label} face mask to S3")
+                        else:
+                            print(f"⚠️  No valid face mask found for {label} after cleaning")
+                    else:
+                        print(f"⚠️  EVF-SAM2 did not return a face mask for {label}")
+                        
+                except Exception as e:
+                    print(f"⚠️  Failed to create animal face mask for {label}: {e}")
+                
+                animal_face_end_time = time.time()
+                animal_face_duration = animal_face_end_time - animal_face_start_time
+                print(f"⏱️  Animal face mask creation took {animal_face_duration:.3f} seconds for {label}")
                 
                 
         except Exception as e:
@@ -412,7 +472,7 @@ class ObjectDetector:
             print(f"⚠️  Failed to create refined crop: {e}")
             return None
     
-    def _create_face_landmark_mask(self, face_landmarks, image_size):
+    def _create_face_landmark_mask(self, face_landmarks, image_size, return_polygon_points=False, douglas_peucker_epsilon=0.002):
         """
         Create a face mask using convex hull of face landmarks.
         
@@ -420,9 +480,11 @@ class ObjectDetector:
             face_landmarks: List of landmark points in format [[x, y, z], ...]
                            where coordinates are normalized (0-1)
             image_size: Tuple of (width, height) for the image
+            return_polygon_points: If True, return simplified polygon points instead of S3 URL
+            douglas_peucker_epsilon: Epsilon ratio for Douglas-Peucker polygon simplification
             
         Returns:
-            dict: Contains 'url' (S3 URL) and 'mask' (numpy array), or None if failed
+            dict: Contains 'url'/'points' and 'mask' (numpy array), or None if failed
         """
         try:
             if not face_landmarks or len(face_landmarks) < 3:
@@ -459,24 +521,31 @@ class ObjectDetector:
             cv2.fillConvexPoly(mask, hull, 255)
             
             # Remove small fragments from the face landmark mask
-            mask_cleaned = self._remove_small_fragments(mask)
-            
-            # Upload cleaned mask to S3
-            mask_url = upload_mask_to_s3(mask_cleaned, image_size, s3_path="face_landmarks")
+            mask_cleaned = remove_small_fragments(mask)
             
             print(f"✅ Created and cleaned face landmark mask from {len(points)} landmarks")
             
-            # Return both URL and cleaned mask array
-            return {
-                'url': mask_url,
-                'mask': mask_cleaned
-            }
+            # Return either polygon points or S3 URL based on flag
+            if return_polygon_points:
+                # Extract simplified polygon points from the mask
+                polygon_points = get_douglas_peucker_points(mask_cleaned, epsilon_ratio=douglas_peucker_epsilon)
+                return {
+                    'points': polygon_points,
+                    'mask': mask_cleaned
+                }
+            else:
+                # Upload cleaned mask to S3
+                mask_url = upload_mask_to_s3(mask_cleaned, image_size, s3_path="face_landmarks")
+                return {
+                    'url': mask_url,
+                    'mask': mask_cleaned
+                }
             
         except Exception as e:
             print(f"⚠️  Failed to create face landmark mask: {e}")
             return None
     
-    def _process_refined_multiclass_masks(self, refined_selfie_result, refined_cropped_image, mask_array, x1, y1, x2, y2, original_image, face_landmark_result=None):
+    def _process_refined_multiclass_masks(self, refined_selfie_result, refined_cropped_image, mask_array, x1, y1, x2, y2, original_image, face_landmark_result=None, return_polygon_points=False, douglas_peucker_epsilon=0.002):
         """
         Process refined selfie segmentation masks with SAM2 intersection.
         Only processes hair, face_skin, and others categories from the refined crop.
@@ -489,9 +558,11 @@ class ObjectDetector:
             x1, y1, x2, y2: Original bounding box coordinates
             original_image: PIL Image object for sizing
             face_landmark_result: Dict containing face landmark mask data {'url': str, 'mask': np.array}
+            return_polygon_points: If True, return simplified polygon points instead of S3 URLs
+            douglas_peucker_epsilon: Epsilon ratio for Douglas-Peucker polygon simplification
             
         Returns:
-            dict: Dictionary of class names to S3 URLs, or None if no valid masks
+            dict: Dictionary of class names to S3 URLs or polygon points, or None if no valid masks
         """
         try:
             # Convert refined selfie mask to numpy array
@@ -584,36 +655,46 @@ class ObjectDetector:
                 head_mask = np.logical_or.reduce(head_mask_components)
                 if np.any(head_mask):
                     # Remove small fragments from head_mask
-                    head_mask_cleaned = self._remove_small_fragments(head_mask.astype(np.uint8) * 255)
+                    head_mask_cleaned = remove_small_fragments(head_mask.astype(np.uint8) * 255)
                     if np.any(head_mask_cleaned):
                         masks_to_upload.append(head_mask_cleaned)
                         class_names.append('head_mask')
                         print(f"✅ Created and cleaned head_mask from {len(head_mask_components)} components")
             
-            # Batch upload all refined masks to S3 in parallel
+            # Process all refined masks based on return_polygon_points flag
             if masks_to_upload:
                 mask_size = (refined_selfie_mask.shape[1], refined_selfie_mask.shape[0])  # (width, height)
+                processed_classes = {}
                 
-                # Use ThreadPoolExecutor for parallel S3 uploads
-                with ThreadPoolExecutor(max_workers=3) as upload_executor:
-                    upload_futures = {
-                        upload_executor.submit(upload_mask_to_s3, mask, mask_size, s3_path="body_parts_refined"): class_name
-                        for mask, class_name in zip(masks_to_upload, class_names)
-                    }
+                if return_polygon_points:
+                    # Extract polygon points from all masks
+                    for mask, class_name in zip(masks_to_upload, class_names):
+                        polygon_points = get_douglas_peucker_points(mask, epsilon_ratio=douglas_peucker_epsilon)
+                        if polygon_points:  # Only add if we got valid points
+                            processed_classes[class_name] = polygon_points
                     
-                    # Collect results as they complete
-                    processed_classes = {}
-                    for future in as_completed(upload_futures):
-                        class_name = upload_futures[future]
-                        try:
-                            s3_url = future.result()
-                            if s3_url:  # Only add if upload was successful
-                                processed_classes[class_name] = s3_url
-                        except Exception as e:
-                            print(f"⚠️  Failed to upload refined {class_name} mask: {e}")
-                    
-                    print(f"✅ Refined masks with SAM2 intersection uploaded: {len(processed_classes)} classes")
-                    return processed_classes if processed_classes else None
+                    print(f"✅ Extracted polygon points for {len(processed_classes)} refined mask classes")
+                else:
+                    # Use ThreadPoolExecutor for parallel S3 uploads
+                    with ThreadPoolExecutor(max_workers=3) as upload_executor:
+                        upload_futures = {
+                            upload_executor.submit(upload_mask_to_s3, mask, mask_size, s3_path="body_parts_refined"): class_name
+                            for mask, class_name in zip(masks_to_upload, class_names)
+                        }
+                        
+                        # Collect results as they complete
+                        for future in as_completed(upload_futures):
+                            class_name = upload_futures[future]
+                            try:
+                                s3_url = future.result()
+                                if s3_url:  # Only add if upload was successful
+                                    processed_classes[class_name] = s3_url
+                            except Exception as e:
+                                print(f"⚠️  Failed to upload refined {class_name} mask: {e}")
+                        
+                        print(f"✅ Refined masks with SAM2 intersection uploaded: {len(processed_classes)} classes")
+                
+                return processed_classes if processed_classes else None
             
             return None
             
@@ -764,50 +845,6 @@ class ObjectDetector:
         except Exception as e:
             print(f"⚠️  Failed to expand contour points: {e}")
             return originalPoints
-    
-    def _remove_small_fragments(self, mask):
-        """
-        Keep only the largest connected component from a binary mask.
-        
-        Args:
-            mask: Binary mask (numpy array) with values 0 or 255
-            
-        Returns:
-            numpy array: Cleaned mask with only the largest component
-        """
-        try:
-            # Convert to binary if needed
-            binary_mask = (mask > 127).astype(np.uint8)
-            
-            # Find connected components
-            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_mask, connectivity=8)
-            
-            # Create output mask
-            cleaned_mask = np.zeros_like(binary_mask, dtype=np.uint8)
-            
-            if num_labels <= 1:  # Only background, no components found
-                print(f"⚠️  No connected components found")
-                return cleaned_mask
-            
-            # Find the largest component (skip background label 0)
-            largest_component_idx = 0
-            largest_area = 0
-            
-            for i in range(1, num_labels):
-                area = stats[i, cv2.CC_STAT_AREA]
-                if area > largest_area:
-                    largest_area = area
-                    largest_component_idx = i
-            
-            # Keep only the largest component
-            cleaned_mask[labels == largest_component_idx] = 255
-            removed_components = num_labels - 2  # Total components minus background and kept component
-            print(f"✅ Kept largest component ({largest_area}px), removed {removed_components} smaller fragments")
-            return cleaned_mask
-                
-        except Exception as e:
-            print(f"⚠️  Failed to remove fragments: {e}")
-            return mask
 
 # Create global instance without initializing models
 object_detector = ObjectDetector()
