@@ -1,0 +1,1495 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Vision Tools - SAM2, Florence-2, Background Removal</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 20px;
+        background-color: #f5f5f5;
+      }
+
+      .container {
+        background: white;
+        padding: 20px;
+        border-radius: 10px;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        margin-bottom: 20px;
+      }
+
+      h1 {
+        color: #333;
+        text-align: center;
+        margin-bottom: 30px;
+      }
+
+      .controls {
+        display: flex;
+        gap: 15px;
+        margin-bottom: 20px;
+        flex-wrap: wrap;
+      }
+
+      .file-input-wrapper {
+        position: relative;
+        overflow: hidden;
+        display: inline-block;
+      }
+
+      .file-input-wrapper input[type="file"] {
+        font-size: 100px;
+        position: absolute;
+        left: 0;
+        top: 0;
+        opacity: 0;
+      }
+
+      .file-input-label {
+        background: #4caf50;
+        color: white;
+        padding: 10px 20px;
+        border-radius: 5px;
+        cursor: pointer;
+        display: inline-block;
+      }
+
+      .file-input-label:hover {
+        background: #45a049;
+      }
+
+      button {
+        background: #2196f3;
+        color: white;
+        border: none;
+        padding: 10px 20px;
+        border-radius: 5px;
+        cursor: pointer;
+        font-size: 14px;
+      }
+
+      button:hover {
+        background: #1976d2;
+      }
+
+      button:disabled {
+        background: #ccc;
+        cursor: not-allowed;
+      }
+
+      .canvas-container {
+        position: relative;
+        display: inline-block;
+        border: 2px solid #ddd;
+        border-radius: 5px;
+        overflow: hidden;
+      }
+
+      /* Checkered background pattern for transparency visualization */
+      .transparency-bg {
+        background-image: linear-gradient(45deg, #ccc 25%, transparent 25%),
+          linear-gradient(-45deg, #ccc 25%, transparent 25%),
+          linear-gradient(45deg, transparent 75%, #ccc 75%),
+          linear-gradient(-45deg, transparent 75%, #ccc 75%);
+        background-size: 20px 20px;
+        background-position: 0 0, 0 10px, 10px -10px, -10px 0px;
+      }
+
+      canvas {
+        display: block;
+        cursor: crosshair;
+      }
+
+      .drawing-mode {
+        margin: 10px 0;
+      }
+
+      .drawing-mode label {
+        margin-right: 15px;
+        cursor: pointer;
+      }
+
+      .results {
+        margin-top: 20px;
+      }
+
+      .result-panel {
+        background: #f9f9f9;
+        padding: 15px;
+        border-radius: 5px;
+        border: 1px solid #ddd;
+      }
+
+      .result-panel h3 {
+        margin-top: 0;
+        color: #333;
+      }
+
+      .loading {
+        text-align: center;
+        color: #666;
+        font-style: italic;
+      }
+
+      .error {
+        color: #d32f2f;
+        background: #ffebee;
+        padding: 10px;
+        border-radius: 5px;
+        border: 1px solid #ffcdd2;
+      }
+
+      .success {
+        color: #388e3c;
+        background: #e8f5e8;
+        padding: 10px;
+        border-radius: 5px;
+        border: 1px solid #c8e6c9;
+      }
+
+      .info {
+        background: #e3f2fd;
+        color: #1976d2;
+        padding: 10px;
+        border-radius: 5px;
+        margin-bottom: 15px;
+        border: 1px solid #bbdefb;
+      }
+
+      .coordinates {
+        font-family: monospace;
+        background: #f5f5f5;
+        padding: 5px;
+        border-radius: 3px;
+        margin: 5px 0;
+      }
+
+      .object-detection-results {
+        background: #f8f9fa;
+        border: 1px solid #dee2e6;
+        border-radius: 5px;
+        padding: 15px;
+        margin-top: 10px;
+      }
+
+      .detected-objects-list {
+        margin: 10px 0;
+        padding-left: 20px;
+      }
+
+      .detected-objects-list li {
+        margin: 5px 0;
+        color: #495057;
+      }
+
+      select,
+      input[type="text"],
+      input[type="url"] {
+        font-size: 14px;
+        padding: 8px 12px;
+        border: 1px solid #ced4da;
+        border-radius: 4px;
+        background-color: #fff;
+      }
+
+      select:focus,
+      input[type="text"]:focus,
+      input[type="url"]:focus {
+        outline: none;
+        border-color: #80bdff;
+        box-shadow: 0 0 0 0.2rem rgba(0, 123, 255, 0.25);
+      }
+    </style>
+  </head>
+  <body>
+    <h1>🤖 AI Vision Tools - SAM2, Florence-2 & More</h1>
+
+    <div class="container">
+      <div class="info">
+        <strong>Instructions:</strong>
+        1. Choose an image file or enter an image URL 2. Select processing mode: •
+        <strong>Point Mode:</strong> Click on the image to place points for segmentation •
+        <strong>Box Mode:</strong> Drag to draw bounding boxes for segmentation •
+        <strong>Text Prompt Mode:</strong> Enter text descriptions for segmentation (e.g., "person",
+        "car", "tree") • <strong>Object Detection:</strong> Automatically detect and label objects
+        using Florence-2 AI model with support for polygon segmentation •
+        <strong>Background Removal:</strong> Automatically remove background using AI (no prompts
+        needed) 3. Configure options for your selected mode 4. Click "Process" to run the selected
+        AI model 5. View results below
+      </div>
+
+      <div class="controls">
+        <div class="file-input-wrapper">
+          <input type="file" id="imageFile" accept="image/*" />
+          <label for="imageFile" class="file-input-label">Choose Image File</label>
+        </div>
+
+        <div>
+          <input
+            type="url"
+            id="imageUrl"
+            placeholder="Or enter image URL..."
+            style="padding: 10px; border: 1px solid #ddd; border-radius: 5px; width: 300px"
+          />
+          <button onclick="loadImageFromUrl()">Load URL</button>
+        </div>
+
+        <button onclick="clearCanvas()" id="clearBtn" disabled>Clear Canvas</button>
+        <button onclick="segment()" id="segmentBtn" disabled>🎯 Process</button>
+      </div>
+
+      <div class="drawing-mode">
+        <label><input type="radio" name="drawMode" value="point" checked /> Point Mode</label>
+        <label><input type="radio" name="drawMode" value="box" /> Box Mode</label>
+        <label><input type="radio" name="drawMode" value="text" /> Text Prompt Mode</label>
+        <label><input type="radio" name="drawMode" value="object-detect" /> Object Detection</label>
+        <label><input type="radio" name="drawMode" value="background" /> Background Removal</label>
+        <label><input type="radio" name="drawMode" value="edit" /> Image Editing</label>
+      </div>
+
+      <div id="textPromptSection" style="display: none; margin-bottom: 15px">
+        <div style="margin-bottom: 10px">
+          <input
+            type="text"
+            id="textPrompt"
+            placeholder="Enter text prompt (e.g., 'person', 'car', 'tree')..."
+            style="
+              padding: 10px;
+              border: 1px solid #ddd;
+              border-radius: 5px;
+              width: 400px;
+              margin-right: 10px;
+            "
+          />
+          <label style="margin-left: 10px">
+            <input type="checkbox" id="semanticMode" /> Semantic mode
+          </label>
+        </div>
+      </div>
+
+      <div id="objectDetectionSection" style="display: none; margin-bottom: 15px">
+        <div style="margin-bottom: 10px">
+          <label style="display: block; margin-bottom: 5px">
+            <strong>Detection Task:</strong>
+          </label>
+          <select
+            id="detectionTask"
+            style="
+              padding: 8px;
+              border: 1px solid #ddd;
+              border-radius: 5px;
+              width: 250px;
+              margin-right: 10px;
+            "
+          >
+            <option value="<OD>">Object Detection (default)</option>
+            <option value="<REFERRING_EXPRESSION_SEGMENTATION>">Text-Based Segmentation</option>
+            <option value="<DENSE_REGION_CAPTION>">Dense Region Caption</option>
+            <option value="<REGION_PROPOSAL>">Region Proposal</option>
+            <option value="<CAPTION>">Image Caption</option>
+            <option value="<DETAILED_CAPTION>">Detailed Caption</option>
+            <option value="<MORE_DETAILED_CAPTION>">More Detailed Caption</option>
+          </select>
+        </div>
+        <div id="textInputSection" style="margin-bottom: 10px; display: none">
+          <input
+            type="text"
+            id="textInput"
+            placeholder="Enter object description (e.g., 'hair', 'person with red shirt')..."
+            style="padding: 10px; border: 1px solid #ddd; border-radius: 5px; width: 400px"
+          />
+          <div style="font-size: 12px; color: #666; margin-top: 5px">
+            Only used for Text-Based Segmentation task
+          </div>
+        </div>
+        <div style="margin-bottom: 10px">
+          <label style="margin-right: 15px">
+            <input type="checkbox" id="returnPolygonPoints" /> Return polygon points instead of S3
+            URLs
+          </label>
+          <div style="font-size: 12px; color: #666; margin-top: 5px">
+            When checked, returns simplified polygon coordinates instead of mask image URLs
+          </div>
+        </div>
+        <div id="polygonSimplificationSection" style="margin-bottom: 10px; display: none">
+          <label style="display: block; margin-bottom: 5px">
+            <strong>Polygon Simplification (Douglas-Peucker epsilon):</strong>
+          </label>
+          <input
+            type="number"
+            id="douglasPeuckerEpsilon"
+            value="0.001"
+            step="0.001"
+            min="0.0001"
+            max="0.1"
+            style="
+              padding: 8px;
+              border: 1px solid #ddd;
+              border-radius: 5px;
+              width: 100px;
+              margin-right: 10px;
+            "
+          />
+          <span style="font-size: 12px; color: #666"
+            >Lower = more detailed, Higher = simpler (0.001-0.1)</span
+          >
+        </div>
+        <div style="font-size: 14px; color: #666">
+          <strong>Note:</strong> Florence-2 model automatically detects objects in the image. No
+          manual annotation needed.<br />
+          <strong>New Features:</strong> Enable "Return polygon points" to get simplified polygon
+          coordinates instead of mask images. Adjust the epsilon value to control polygon detail
+          level.
+        </div>
+      </div>
+
+      <div id="backgroundRemovalSection" style="display: none; margin-bottom: 15px">
+        <div style="margin-bottom: 10px">
+          <label style="margin-right: 15px">
+            <input type="checkbox" id="returnMask" /> Also return mask
+          </label>
+          <span style="color: #666; font-size: 14px"
+            >Automatically removes background using AI</span
+          >
+        </div>
+      </div>
+
+      <div id="imageEditingSection" style="display: none; margin-bottom: 15px">
+        <div style="margin-bottom: 10px">
+          <input
+            type="text"
+            id="editInstruction"
+            placeholder="Enter editing instruction (e.g., 'turn him into a cyborg', 'make the sky sunset colored')..."
+            style="
+              padding: 10px;
+              border: 1px solid #ddd;
+              border-radius: 5px;
+              width: 500px;
+              margin-right: 10px;
+            "
+          />
+        </div>
+        <div style="margin-bottom: 10px; font-size: 14px; color: #666">
+          <strong>Examples:</strong>
+          <ul style="margin: 5px 0; padding-left: 20px">
+            <li>"add sunglasses to the person"</li>
+            <li>"change the background to a beach"</li>
+            <li>"make it look like a painting"</li>
+            <li>"turn the car red"</li>
+          </ul>
+        </div>
+        <div style="margin-bottom: 10px">
+          <label style="margin-right: 15px">
+            <span style="margin-right: 5px">Steps:</span>
+            <input
+              type="number"
+              id="editSteps"
+              value="20"
+              min="1"
+              max="50"
+              style="width: 60px; padding: 5px; border: 1px solid #ddd; border-radius: 3px"
+            />
+          </label>
+          <label style="margin-right: 15px">
+            <span style="margin-right: 5px">Guidance Scale:</span>
+            <input
+              type="number"
+              id="editGuidanceScale"
+              value="7.5"
+              min="1"
+              max="20"
+              step="0.5"
+              style="width: 80px; padding: 5px; border: 1px solid #ddd; border-radius: 3px"
+            />
+          </label>
+          <label style="margin-right: 15px">
+            <span style="margin-right: 5px">Image Guidance:</span>
+            <input
+              type="number"
+              id="editImageGuidance"
+              value="1.5"
+              min="1"
+              max="3"
+              step="0.1"
+              style="width: 80px; padding: 5px; border: 1px solid #ddd; border-radius: 3px"
+            />
+          </label>
+        </div>
+      </div>
+
+      <div class="canvas-container">
+        <canvas id="canvas"></canvas>
+      </div>
+
+      <div id="coordinates"></div>
+    </div>
+
+    <div class="results">
+      <div class="result-panel">
+        <h3>Segmentation Result</h3>
+        <div id="result"></div>
+        <canvas
+          id="maskCanvas"
+          style="max-width: 100%; border: 1px solid #ddd; border-radius: 5px; margin-top: 10px"
+        ></canvas>
+      </div>
+    </div>
+
+    <script>
+      let canvas, ctx, maskCanvas, maskCtx;
+      let originalImage = null;
+      let imageBase64 = null;
+      let points = [];
+      let boxes = [];
+      let isDrawing = false;
+      let startX, startY;
+      let currentBox = null;
+      let justCompletedBox = false;
+      let imageScaleX = 1;
+      let imageScaleY = 1;
+
+      // API endpoints
+      const API_URL = "https://vnxf8dj0ldlmhs-8000.proxy.runpod.net/segment";
+      const EVF_API_URL = "https://vnxf8dj0ldlmhs-8000.proxy.runpod.net/segment/evf";
+      const BACKGROUND_REMOVAL_URL =
+        "https://vnxf8dj0ldlmhs-8000.proxy.runpod.net/remove-background";
+      const IMAGE_EDIT_URL = "https://vnxf8dj0ldlmhs-8000.proxy.runpod.net/edit-image";
+      const OBJECT_DETECTION_URL = "https://vnxf8dj0ldlmhs-8000.proxy.runpod.net/detect-objects";
+
+      window.onload = function () {
+        canvas = document.getElementById("canvas");
+        ctx = canvas.getContext("2d");
+        maskCanvas = document.getElementById("maskCanvas");
+        maskCtx = maskCanvas.getContext("2d");
+
+        // File input handler
+        document.getElementById("imageFile").addEventListener("change", handleFileSelect);
+
+        // Canvas event handlers
+        canvas.addEventListener("mousedown", onMouseDown);
+        canvas.addEventListener("mousemove", onMouseMove);
+        canvas.addEventListener("mouseup", onMouseUp);
+        canvas.addEventListener("click", onCanvasClick);
+
+        // Drawing mode change handlers
+        document.querySelectorAll('input[name="drawMode"]').forEach((radio) => {
+          radio.addEventListener("change", onDrawModeChange);
+        });
+
+        // Text prompt input handlers
+        document.getElementById("textPrompt").addEventListener("input", updateCoordinatesDisplay);
+        document
+          .getElementById("semanticMode")
+          .addEventListener("change", updateCoordinatesDisplay);
+
+        // Background removal input handlers
+        document.getElementById("returnMask").addEventListener("change", updateCoordinatesDisplay);
+
+        // Object detection input handlers
+        document.getElementById("detectionTask").addEventListener("change", function () {
+          const task = this.value;
+          const textInputSection = document.getElementById("textInputSection");
+
+          // Show text input only for referring expression segmentation
+          if (task === "<REFERRING_EXPRESSION_SEGMENTATION>") {
+            textInputSection.style.display = "block";
+          } else {
+            textInputSection.style.display = "none";
+          }
+          updateCoordinatesDisplay();
+        });
+        document.getElementById("textInput").addEventListener("input", updateCoordinatesDisplay);
+
+        // New handlers for polygon points feature
+        document.getElementById("returnPolygonPoints").addEventListener("change", function () {
+          const polygonSection = document.getElementById("polygonSimplificationSection");
+          polygonSection.style.display = this.checked ? "block" : "none";
+          updateCoordinatesDisplay();
+        });
+        document
+          .getElementById("douglasPeuckerEpsilon")
+          .addEventListener("input", updateCoordinatesDisplay);
+      };
+
+      function handleFileSelect(event) {
+        const file = event.target.files[0];
+        if (!file) return;
+
+        const reader = new FileReader();
+        reader.onload = function (e) {
+          loadImage(e.target.result, true);
+        };
+        reader.readAsDataURL(file);
+      }
+
+      function loadImageFromUrl() {
+        const url = document.getElementById("imageUrl").value;
+        if (!url) {
+          alert("Please enter an image URL");
+          return;
+        }
+
+        // For URL images, we'll let the server handle the download
+        loadImage(url, false);
+      }
+
+      function loadImage(src, isBase64) {
+        const img = new Image();
+        img.crossOrigin = "anonymous";
+
+        img.onload = function () {
+          originalImage = img;
+
+          // Resize canvas to fit image
+          const maxWidth = 800;
+          const maxHeight = 600;
+          let { width, height } = img;
+          const originalWidth = width;
+          const originalHeight = height;
+
+          if (width > maxWidth || height > maxHeight) {
+            const ratio = Math.min(maxWidth / width, maxHeight / height);
+            width *= ratio;
+            height *= ratio;
+          }
+
+          // Calculate scaling factors (canvas to original image)
+          imageScaleX = originalWidth / width;
+          imageScaleY = originalHeight / height;
+
+          canvas.width = width;
+          canvas.height = height;
+          maskCanvas.width = width;
+          maskCanvas.height = height;
+
+          // Draw image
+          ctx.drawImage(img, 0, 0, width, height);
+
+          // Store base64 if provided, otherwise we'll use URL
+          if (isBase64) {
+            imageBase64 = src.split(",")[1]; // Remove data:image/jpeg;base64, prefix
+          } else {
+            imageBase64 = null;
+          }
+
+          // Reset prompts
+          clearPrompts();
+
+          // Enable controls
+          document.getElementById("clearBtn").disabled = false;
+          document.getElementById("segmentBtn").disabled = false;
+
+          updateCoordinatesDisplay();
+        };
+
+        img.onerror = function () {
+          alert("Failed to load image. Please try another image.");
+        };
+
+        if (isBase64) {
+          img.src = src;
+        } else {
+          // For URL images, we need to handle CORS
+          img.src = src;
+        }
+      }
+
+      function getDrawMode() {
+        return document.querySelector('input[name="drawMode"]:checked').value;
+      }
+
+      function onDrawModeChange() {
+        const mode = getDrawMode();
+        const textPromptSection = document.getElementById("textPromptSection");
+        const objectDetectionSection = document.getElementById("objectDetectionSection");
+        const backgroundRemovalSection = document.getElementById("backgroundRemovalSection");
+        const imageEditingSection = document.getElementById("imageEditingSection");
+        const maskCanvas = document.getElementById("maskCanvas");
+        const segmentBtn = document.getElementById("segmentBtn");
+
+        // Hide all sections first
+        textPromptSection.style.display = "none";
+        objectDetectionSection.style.display = "none";
+        backgroundRemovalSection.style.display = "none";
+        imageEditingSection.style.display = "none";
+
+        // Remove transparency background when switching away from background removal
+        if (mode !== "background") {
+          maskCanvas.classList.remove("transparency-bg");
+        }
+
+        // Update button text based on mode
+        if (mode === "edit") {
+          segmentBtn.textContent = "🎨 Edit Image";
+          imageEditingSection.style.display = "block";
+        } else if (mode === "background") {
+          segmentBtn.textContent = "🖼️ Remove Background";
+          backgroundRemovalSection.style.display = "block";
+        } else if (mode === "text") {
+          segmentBtn.textContent = "🎯 Segment";
+          textPromptSection.style.display = "block";
+        } else if (mode === "object-detect") {
+          segmentBtn.textContent = "🔍 Detect Objects";
+          objectDetectionSection.style.display = "block";
+        } else {
+          segmentBtn.textContent = "🎯 Segment";
+        }
+      }
+
+      function onCanvasClick(event) {
+        if (getDrawMode() === "point" && !justCompletedBox) {
+          const rect = canvas.getBoundingClientRect();
+          const x = (event.clientX - rect.left) * (canvas.width / rect.width);
+          const y = (event.clientY - rect.top) * (canvas.height / rect.height);
+
+          // Add point - all points are foreground by default
+          const label = 1; // Always foreground
+          points.push({
+            x: Math.round(x * imageScaleX),
+            y: Math.round(y * imageScaleY),
+            label,
+          });
+
+          drawPrompts();
+          updateCoordinatesDisplay();
+        }
+        // Reset the flag after any click event
+        justCompletedBox = false;
+      }
+
+      function onMouseDown(event) {
+        if (getDrawMode() === "box") {
+          event.preventDefault(); // Prevent click event interference
+          isDrawing = true;
+          const rect = canvas.getBoundingClientRect();
+          startX = (event.clientX - rect.left) * (canvas.width / rect.width);
+          startY = (event.clientY - rect.top) * (canvas.height / rect.height);
+          currentBox = null;
+          justCompletedBox = false;
+        }
+      }
+
+      function onMouseMove(event) {
+        if (isDrawing && getDrawMode() === "box") {
+          const rect = canvas.getBoundingClientRect();
+          const currentX = (event.clientX - rect.left) * (canvas.width / rect.width);
+          const currentY = (event.clientY - rect.top) * (canvas.height / rect.height);
+
+          currentBox = {
+            x1: Math.min(startX, currentX),
+            y1: Math.min(startY, currentY),
+            x2: Math.max(startX, currentX),
+            y2: Math.max(startY, currentY),
+          };
+
+          drawPrompts();
+        }
+      }
+
+      function onMouseUp(event) {
+        if (isDrawing && getDrawMode() === "box" && currentBox) {
+          // Add the box to the boxes array - scale to original image coordinates
+          boxes.push({
+            x1: Math.round(currentBox.x1 * imageScaleX),
+            y1: Math.round(currentBox.y1 * imageScaleY),
+            x2: Math.round(currentBox.x2 * imageScaleX),
+            y2: Math.round(currentBox.y2 * imageScaleY),
+          });
+
+          currentBox = null;
+          isDrawing = false;
+          justCompletedBox = true; // Set flag to prevent click event interference
+          drawPrompts();
+          updateCoordinatesDisplay();
+        }
+      }
+
+      function drawPrompts() {
+        // Redraw original image
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        if (originalImage) {
+          ctx.drawImage(originalImage, 0, 0, canvas.width, canvas.height);
+        }
+
+        // Draw points (convert from original image coordinates to canvas coordinates)
+        points.forEach((point, index) => {
+          ctx.fillStyle = point.label === 1 ? "#00ff00" : "#ff0000"; // Green for foreground, red for background
+          ctx.strokeStyle = "#000000";
+          ctx.lineWidth = 2;
+
+          const canvasX = point.x / imageScaleX;
+          const canvasY = point.y / imageScaleY;
+
+          ctx.beginPath();
+          ctx.arc(canvasX, canvasY, 6, 0, 2 * Math.PI);
+          ctx.fill();
+          ctx.stroke();
+
+          // Add label
+          ctx.fillStyle = "#000000";
+          ctx.font = "12px Arial";
+          ctx.fillText(point.label === 1 ? "FG" : "BG", canvasX + 10, canvasY - 10);
+        });
+
+        // Draw boxes (convert from original image coordinates to canvas coordinates)
+        boxes.forEach((box, index) => {
+          ctx.strokeStyle = "#0099ff";
+          ctx.lineWidth = 3;
+          ctx.setLineDash([5, 5]);
+
+          const canvasX1 = box.x1 / imageScaleX;
+          const canvasY1 = box.y1 / imageScaleY;
+          const canvasX2 = box.x2 / imageScaleX;
+          const canvasY2 = box.y2 / imageScaleY;
+
+          ctx.strokeRect(canvasX1, canvasY1, canvasX2 - canvasX1, canvasY2 - canvasY1);
+
+          ctx.setLineDash([]);
+        });
+
+        // Draw current box being drawn (already in canvas coordinates)
+        if (currentBox) {
+          ctx.strokeStyle = "#ff9900";
+          ctx.lineWidth = 2;
+          ctx.setLineDash([3, 3]);
+
+          ctx.strokeRect(
+            currentBox.x1,
+            currentBox.y1,
+            currentBox.x2 - currentBox.x1,
+            currentBox.y2 - currentBox.y1
+          );
+
+          ctx.setLineDash([]);
+        }
+      }
+
+      function toggleTransparencyBackground() {
+        maskCanvas.classList.toggle("transparency-bg");
+      }
+
+      function clearCanvas() {
+        clearPrompts();
+
+        // Remove transparency background from mask canvas
+        const maskCanvas = document.getElementById("maskCanvas");
+        maskCanvas.classList.remove("transparency-bg");
+
+        if (originalImage) {
+          ctx.drawImage(originalImage, 0, 0, canvas.width, canvas.height);
+        }
+        updateCoordinatesDisplay();
+      }
+
+      function clearPrompts() {
+        points = [];
+        boxes = [];
+        currentBox = null;
+        justCompletedBox = false;
+        // Note: Don't reset imageScaleX/Y here as they're tied to the loaded image
+      }
+
+      function updateCoordinatesDisplay() {
+        let html = "";
+        const mode = getDrawMode();
+
+        if (mode === "text") {
+          const prompt = document.getElementById("textPrompt").value;
+          const semantic = document.getElementById("semanticMode").checked;
+          if (prompt) {
+            html += '<div class="coordinates"><strong>Text Prompt:</strong> ';
+            html += prompt;
+            if (semantic) {
+              html += " <em>(semantic mode)</em>";
+            }
+            html += "</div>";
+          } else {
+            html = '<div class="coordinates"><em>Enter a text prompt above</em></div>';
+          }
+        } else if (mode === "background") {
+          const returnMask = document.getElementById("returnMask").checked;
+          html =
+            '<div class="coordinates"><strong>Background Removal:</strong> Ready to remove background automatically';
+          if (returnMask) {
+            html += " <em>(will also return mask)</em>";
+          }
+          html += "</div>";
+        } else {
+          if (points.length > 0) {
+            html += '<div class="coordinates"><strong>Points:</strong> ';
+            html += points
+              .map((p) => `(${p.x}, ${p.y}, ${p.label === 1 ? "FG" : "BG"})`)
+              .join(", ");
+            html += "</div>";
+          }
+
+          if (boxes.length > 0) {
+            html += '<div class="coordinates"><strong>Boxes:</strong> ';
+            html += boxes.map((b) => `[${b.x1}, ${b.y1}, ${b.x2}, ${b.y2}]`).join(", ");
+            html += "</div>";
+          }
+
+          if (points.length === 0 && boxes.length === 0) {
+            html =
+              '<div class="coordinates"><em>No prompts selected (will use center point)</em></div>';
+          }
+        }
+
+        document.getElementById("coordinates").innerHTML = html;
+      }
+
+      function buildRequestPayload() {
+        const mode = getDrawMode();
+        const payload = {};
+
+        // Add image source
+        if (imageBase64) {
+          payload.image_b64 = imageBase64;
+        } else {
+          payload.imageUrl = document.getElementById("imageUrl").value;
+        }
+
+        if (mode === "text") {
+          // Text prompt mode - prepare EVF payload
+          const prompt = document.getElementById("textPrompt").value;
+          const semantic = document.getElementById("semanticMode").checked;
+
+          if (!prompt) {
+            throw new Error("Please enter a text prompt");
+          }
+
+          payload.prompt = prompt;
+          payload.semantic = semantic;
+        } else if (mode === "background") {
+          // Background removal mode - prepare RMBG payload
+          const returnMask = document.getElementById("returnMask").checked;
+          payload.return_mask = returnMask;
+        } else if (mode === "edit") {
+          // Image editing mode - prepare InstructPix2Pix payload
+          const instruction = document.getElementById("editInstruction").value;
+          const steps = parseInt(document.getElementById("editSteps").value) || 20;
+          const guidanceScale =
+            parseFloat(document.getElementById("editGuidanceScale").value) || 7.5;
+          const imageGuidance =
+            parseFloat(document.getElementById("editImageGuidance").value) || 1.5;
+
+          if (!instruction) {
+            throw new Error("Please enter an editing instruction");
+          }
+
+          payload.instruction = instruction;
+          payload.num_inference_steps = steps;
+          payload.guidance_scale = guidanceScale;
+          payload.image_guidance_scale = imageGuidance;
+        } else if (mode === "object-detect") {
+          // Object detection mode - prepare Florence-2 payload
+          const task = document.getElementById("detectionTask").value;
+          const textInput = document.getElementById("textInput").value;
+          const returnPolygonPoints = document.getElementById("returnPolygonPoints").checked;
+          const douglasPeuckerEpsilon =
+            parseFloat(document.getElementById("douglasPeuckerEpsilon").value) || 0.001;
+
+          payload.task = task;
+          if (textInput && task === "<REFERRING_EXPRESSION_SEGMENTATION>") {
+            payload.text_input = textInput;
+          }
+
+          // Add new polygon points parameters
+          payload.return_polygon_points = returnPolygonPoints;
+          if (returnPolygonPoints) {
+            payload.douglas_peucker_epsilon = douglasPeuckerEpsilon;
+          }
+
+          // Optional: add confidence threshold if desired
+          payload.confidence_threshold = 0.3;
+        } else {
+          // Point/Box mode - prepare SAM2 payload
+          if (points.length === 1) {
+            payload.point = points[0];
+          } else if (points.length > 1) {
+            payload.points = points;
+          }
+
+          if (boxes.length === 1) {
+            payload.box = boxes[0];
+          } else if (boxes.length > 1) {
+            payload.boxes = boxes;
+          }
+        }
+
+        return payload;
+      }
+
+      async function segment() {
+        const resultDiv = document.getElementById("result");
+
+        try {
+          // Build request payload
+          const payload = buildRequestPayload();
+          const mode = getDrawMode();
+
+          // Choose the appropriate API endpoint
+          let apiUrl;
+          if (mode === "text") {
+            apiUrl = EVF_API_URL;
+          } else if (mode === "background") {
+            apiUrl = BACKGROUND_REMOVAL_URL;
+          } else if (mode === "edit") {
+            apiUrl = IMAGE_EDIT_URL;
+          } else if (mode === "object-detect") {
+            apiUrl = OBJECT_DETECTION_URL;
+          } else {
+            apiUrl = API_URL;
+          }
+
+          // Show loading
+          resultDiv.innerHTML = '<div class="loading">🔄 Processing image...</div>';
+
+          // Make API request
+          const response = await fetch(apiUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(payload),
+          });
+
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+          }
+
+          const result = await response.json();
+
+          // Handle different response formats based on mode
+          if (mode === "background") {
+            // Background removal response
+            resultDiv.innerHTML = `
+                        <div class="success">✅ Background removal successful!</div>
+                        <div style="margin-top: 10px;">
+                            <strong>Result:</strong> Image with transparent background
+                        </div>
+                    `;
+
+            // Display the background-removed image
+            displayBackgroundRemovedImage(result);
+          } else if (mode === "edit") {
+            // Image editing response
+            resultDiv.innerHTML = `
+                        <div class="success">✅ Image editing successful!</div>
+                        <div style="margin-top: 10px;">
+                            <strong>Result:</strong> Edited image based on instruction
+                        </div>
+                    `;
+
+            // Display the edited image
+            displayEditedImage(result);
+          } else if (mode === "object-detect") {
+            // Object detection response
+            displayObjectDetectionResults(result);
+          } else {
+            // Segmentation response (SAM2 or EVF)
+            if (result.mask_url) {
+              // New format: mask is provided as URL
+              resultDiv.innerHTML = `
+                            <div class="success">✅ Segmentation successful!</div>
+                            <div style="margin-top: 10px;">
+                                <strong>Mask URL:</strong> <a href="${result.mask_url}" target="_blank" style="color: #007bff; text-decoration: none;">View/Download Mask</a>
+                                <br><small style="color: #666;">Mask overlay will be displayed on the image below</small>
+                            </div>
+                        `;
+
+              // Display mask from URL
+              displayMaskFromUrl(result.mask_url);
+            } else if (result.mask) {
+              // Legacy format: mask is provided as array
+              resultDiv.innerHTML = `
+                            <div class="success">✅ Segmentation successful!</div>
+                            <div style="margin-top: 10px;">
+                                <strong>Mask dimensions:</strong> ${result.mask.length} × ${result.mask[0].length}
+                            </div>
+                        `;
+
+              // Draw mask overlay
+              drawMask(result.mask);
+            } else {
+              resultDiv.innerHTML = `
+                            <div class="error">❌ No mask data received</div>
+                        `;
+            }
+          }
+        } catch (error) {
+          console.error("Processing error:", error);
+          resultDiv.innerHTML = `<div class="error">❌ Error: ${error.message}</div>`;
+        }
+      }
+
+      function displayBackgroundRemovedImage(result) {
+        const resultDiv = document.getElementById("result");
+
+        // Display the background-removed image directly in the result div
+        resultDiv.innerHTML = `
+                <div style="margin-top: 10px;">
+                    <h3>Background Removed:</h3>
+                    <img src="data:image/png;base64,${result.image_b64}" 
+                         style="max-width: 100%; border: 1px solid #ccc; background: 
+                         linear-gradient(45deg, #ccc 25%, transparent 25%), 
+                         linear-gradient(-45deg, #ccc 25%, transparent 25%), 
+                         linear-gradient(45deg, transparent 75%, #ccc 75%), 
+                         linear-gradient(-45deg, transparent 75%, #ccc 75%);
+                         background-size: 20px 20px;
+                         background-position: 0 0, 0 10px, 10px -10px, -10px 0px;" 
+                         alt="Background Removed Image" />
+                </div>
+            `;
+
+        // Clear the mask canvas
+        maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+      }
+
+      function displayEditedImage(result) {
+        const resultDiv = document.getElementById("result");
+
+        // Display the edited image directly in the result div
+        resultDiv.innerHTML = `
+                <div style="margin-top: 10px;">
+                    <h3>Edited Image:</h3>
+                    <img src="data:image/png;base64,${result.edited_image_b64}" 
+                         style="max-width: 100%; border: 1px solid #ccc;" 
+                         alt="Edited Image" />
+                </div>
+            `;
+
+        // Clear the mask canvas
+        maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+      }
+
+      function displayObjectDetectionResults(result) {
+        const resultDiv = document.getElementById("result");
+        const maskCanvas = document.getElementById("maskCanvas");
+
+        // Clear the mask canvas first
+        maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+
+        // Build the result HTML
+        let resultHtml = `
+                <div class="success">✅ Object detection successful!</div>
+                <div style="margin-top: 10px;">
+                    <strong>Task:</strong> ${result.task_used || "Object Detection"}<br>
+                    <strong>Objects found:</strong> ${result.objects.length}
+                </div>
+            `;
+
+        if (result.objects.length > 0) {
+          resultHtml += `
+                    <div style="margin-top: 15px;">
+                        <h4>Detected Objects:</h4>
+                        <ul style="margin: 10px 0; padding-left: 20px;">
+                `;
+
+          result.objects.forEach((obj, index) => {
+            const confidence = obj.confidence ? ` (${(obj.confidence * 100).toFixed(1)}%)` : "";
+            let objectInfo = `<li><strong>${obj.label}</strong>${confidence}`;
+
+            // Show multiclasses if available
+            if (obj.multiclasses && typeof obj.multiclasses === "object") {
+              const maskTypes = Object.keys(obj.multiclasses);
+              if (maskTypes.length > 0) {
+                objectInfo += ` <span style="color: #666; font-size: 12px;">(masks: ${maskTypes.join(
+                  ", "
+                )})</span>`;
+              }
+            }
+
+            // Show if main segment mask is available as polygon points
+            if (obj.segment_mask && Array.isArray(obj.segment_mask)) {
+              const pointCount = obj.segment_mask.length;
+              objectInfo += ` <span style="color: #28a745; font-size: 12px;">[${pointCount} main polygon points]</span>`;
+            }
+
+            // Legacy support: Show if polygon points are available in old format
+            if (
+              obj.segment_mask &&
+              typeof obj.segment_mask === "object" &&
+              obj.segment_mask.polygon_points
+            ) {
+              const pointCount = obj.segment_mask.polygon_points.length;
+              objectInfo += ` <span style="color: #28a745; font-size: 12px;">[${pointCount} polygon points]</span>`;
+            }
+
+            // Show if segment mask URL is available
+            if (obj.segment_mask && typeof obj.segment_mask === "string") {
+              objectInfo += ` <span style="color: #007bff; font-size: 12px;">[segment mask available]</span>`;
+            }
+
+            objectInfo += `</li>`;
+            resultHtml += objectInfo;
+          });
+
+          resultHtml += `
+                        </ul>
+                    </div>
+                `;
+
+          // Draw bounding boxes and polygons on the image
+          drawObjectBoundingBoxes(result.objects);
+          drawObjectPolygons(result.objects);
+        }
+
+        // Display segmentation mask if available (for RES tasks)
+        if (result.segmentation_mask) {
+          resultHtml += `
+                    <div style="margin-top: 10px;">
+                        <strong>Segmentation mask:</strong> Available for referring expression segmentation
+                    </div>
+                `;
+          // Display the segmentation mask
+          displaySegmentationMask(result.segmentation_mask);
+        }
+
+        // Show polygon points summary if any objects have them
+        const objectsWithPolygons = result.objects.filter(
+          (obj) =>
+            (obj.segment_mask && Array.isArray(obj.segment_mask)) ||
+            (obj.segment_mask &&
+              typeof obj.segment_mask === "object" &&
+              obj.segment_mask.polygon_points) ||
+            (obj.multiclasses && Object.keys(obj.multiclasses).length > 0)
+        );
+        if (objectsWithPolygons.length > 0) {
+          let polygonSummary = "";
+          let mainPolygonCount = result.objects.filter(
+            (obj) => obj.segment_mask && Array.isArray(obj.segment_mask)
+          ).length;
+          let multiclassCount = result.objects.filter(
+            (obj) => obj.multiclasses && Object.keys(obj.multiclasses).length > 0
+          ).length;
+
+          if (mainPolygonCount > 0) {
+            polygonSummary += `${mainPolygonCount} main segment polygon(s)`;
+          }
+          if (multiclassCount > 0) {
+            if (polygonSummary) polygonSummary += ", ";
+            polygonSummary += `${multiclassCount} object(s) with multiclass masks`;
+          }
+
+          resultHtml += `
+                    <div style="margin-top: 10px; font-size: 12px; color: #28a745;">
+                        <strong>Polygon Data:</strong> ${polygonSummary}
+                    </div>
+                `;
+        }
+
+        resultDiv.innerHTML = resultHtml;
+      }
+
+      function displayMaskFromUrl(maskUrl) {
+        if (!maskUrl) return;
+
+        // Clear the mask canvas first
+        maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+
+        // First draw the original image
+        if (originalImage) {
+          maskCtx.drawImage(originalImage, 0, 0, maskCanvas.width, maskCanvas.height);
+        }
+
+        // Load and overlay the mask image
+        const maskImage = new Image();
+        maskImage.crossOrigin = "anonymous"; // Handle CORS if needed
+
+        maskImage.onload = function () {
+          // Create a temporary canvas to process the mask
+          const tempCanvas = document.createElement("canvas");
+          const tempCtx = tempCanvas.getContext("2d");
+          tempCanvas.width = maskImage.width;
+          tempCanvas.height = maskImage.height;
+
+          // Draw the mask image to get pixel data
+          tempCtx.drawImage(maskImage, 0, 0);
+          const imageData = tempCtx.getImageData(0, 0, maskImage.width, maskImage.height);
+          const data = imageData.data;
+
+          // Convert to semi-transparent overlay (assuming white mask, black background)
+          for (let i = 0; i < data.length; i += 4) {
+            const r = data[i];
+            const g = data[i + 1];
+            const b = data[i + 2];
+
+            // If it's a white/light pixel (mask area)
+            if (r > 128 && g > 128 && b > 128) {
+              data[i] = 0; // R - green
+              data[i + 1] = 255; // G - green
+              data[i + 2] = 0; // B - green
+              data[i + 3] = 128; // A - semi-transparent
+            } else {
+              // Make black areas transparent
+              data[i + 3] = 0;
+            }
+          }
+
+          // Put the processed data back
+          tempCtx.putImageData(imageData, 0, 0);
+
+          // Scale and draw the mask overlay on the main canvas
+          maskCtx.drawImage(tempCanvas, 0, 0, maskCanvas.width, maskCanvas.height);
+        };
+
+        maskImage.onerror = function () {
+          console.error("Failed to load mask image from URL:", maskUrl);
+          const resultDiv = document.getElementById("result");
+          resultDiv.innerHTML += `<div class="error">❌ Failed to load mask image</div>`;
+        };
+
+        // Start loading the mask image
+        maskImage.src = maskUrl;
+      }
+
+      function toggleTransparencyBackground() {
+        const maskCanvas = document.getElementById("maskCanvas");
+        maskCanvas.classList.toggle("transparency-bg");
+      }
+
+      function drawMask(mask) {
+        if (!mask || mask.length === 0) return;
+
+        // Remove transparency background for regular mask display
+        maskCanvas.classList.remove("transparency-bg");
+
+        const height = mask.length;
+        const width = mask[0].length;
+
+        // Create image data for the mask
+        const imageData = maskCtx.createImageData(width, height);
+        const data = imageData.data;
+
+        for (let y = 0; y < height; y++) {
+          for (let x = 0; x < width; x++) {
+            const idx = (y * width + x) * 4;
+            const maskValue = mask[y][x];
+
+            if (maskValue > 0.5) {
+              // Foreground: semi-transparent green
+              data[idx] = 0; // R
+              data[idx + 1] = 255; // G
+              data[idx + 2] = 0; // B
+              data[idx + 3] = 128; // A (semi-transparent)
+            } else {
+              // Background: transparent
+              data[idx] = 0;
+              data[idx + 1] = 0;
+              data[idx + 2] = 0;
+              data[idx + 3] = 0;
+            }
+          }
+        }
+
+        // Clear and draw the mask
+        maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+
+        // First draw the original image
+        if (originalImage) {
+          maskCtx.drawImage(originalImage, 0, 0, maskCanvas.width, maskCanvas.height);
+        }
+
+        // Then overlay the mask
+        const tempCanvas = document.createElement("canvas");
+        tempCanvas.width = width;
+        tempCanvas.height = height;
+        const tempCtx = tempCanvas.getContext("2d");
+        tempCtx.putImageData(imageData, 0, 0);
+
+        // Scale and draw the mask overlay
+        maskCtx.drawImage(tempCanvas, 0, 0, maskCanvas.width, maskCanvas.height);
+      }
+
+      function drawObjectBoundingBoxes(objects) {
+        if (!originalImage || !objects || objects.length === 0) return;
+
+        // Clear the mask canvas and redraw the original image
+        maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+        maskCtx.drawImage(originalImage, 0, 0, maskCanvas.width, maskCanvas.height);
+
+        // Calculate scaling factors
+        const scaleX = maskCanvas.width / originalImage.width;
+        const scaleY = maskCanvas.height / originalImage.height;
+
+        // Colors for different objects
+        const colors = [
+          "#FF0000",
+          "#00FF00",
+          "#0000FF",
+          "#FFFF00",
+          "#FF00FF",
+          "#00FFFF",
+          "#FFA500",
+          "#800080",
+        ];
+
+        objects.forEach((obj, index) => {
+          if (obj.bbox && obj.bbox.length === 4) {
+            const [x1, y1, x2, y2] = obj.bbox;
+            const color = colors[index % colors.length];
+
+            // Scale coordinates to canvas size
+            const scaledX1 = x1 * scaleX;
+            const scaledY1 = y1 * scaleY;
+            const scaledX2 = x2 * scaleX;
+            const scaledY2 = y2 * scaleY;
+
+            // Draw bounding box
+            maskCtx.strokeStyle = color;
+            maskCtx.lineWidth = 3;
+            maskCtx.strokeRect(scaledX1, scaledY1, scaledX2 - scaledX1, scaledY2 - scaledY1);
+
+            // Draw label background
+            const label = obj.label;
+            const confidence = obj.confidence ? ` ${(obj.confidence * 100).toFixed(0)}%` : "";
+            const text = `${label}${confidence}`;
+
+            maskCtx.font = "14px Arial";
+            const textWidth = maskCtx.measureText(text).width;
+
+            maskCtx.fillStyle = color;
+            maskCtx.fillRect(scaledX1, scaledY1 - 20, textWidth + 8, 20);
+
+            // Draw label text
+            maskCtx.fillStyle = "white";
+            maskCtx.fillText(text, scaledX1 + 4, scaledY1 - 6);
+          }
+        });
+      }
+
+      function drawObjectPolygons(objects) {
+        if (!originalImage || !objects || objects.length === 0) return;
+
+        // Calculate scaling factors
+        const scaleX = maskCanvas.width / originalImage.width;
+        const scaleY = maskCanvas.height / originalImage.height;
+
+        // Colors for different objects and their sub-masks
+        const colors = [
+          "#FF0000",
+          "#00FF00",
+          "#0000FF",
+          "#FFFF00",
+          "#FF00FF",
+          "#00FFFF",
+          "#FFA500",
+          "#800080",
+        ];
+        const subColors = [
+          "#FF6666",
+          "#66FF66",
+          "#6666FF",
+          "#FFFF66",
+          "#FF66FF",
+          "#66FFFF",
+          "#FFB366",
+          "#B366B3",
+        ];
+
+        objects.forEach((obj, index) => {
+          const color = colors[index % colors.length];
+          const subColor = subColors[index % subColors.length];
+
+          // Draw main segment_mask if it's an array of points (these are absolute coordinates)
+          if (obj.segment_mask && Array.isArray(obj.segment_mask) && obj.segment_mask.length > 0) {
+            drawPolygonPoints(obj.segment_mask, color, scaleX, scaleY, "Main Segment");
+          }
+
+          // Draw multiclass masks if available (these are relative to bbox)
+          if (obj.multiclasses && typeof obj.multiclasses === "object" && obj.bbox) {
+            const [bboxX, bboxY] = obj.bbox; // Get bbox top-left corner
+
+            Object.entries(obj.multiclasses).forEach(([maskType, points], subIndex) => {
+              if (Array.isArray(points) && points.length > 0) {
+                // Convert relative points to absolute coordinates
+                const absolutePoints = points.map(([x, y]) => [x + bboxX, y + bboxY]);
+
+                // Use alternating colors for different mask types
+                const maskColor = subIndex % 2 === 0 ? subColor : color;
+                drawPolygonPoints(absolutePoints, maskColor, scaleX, scaleY, maskType);
+              }
+            });
+          }
+
+          // Legacy support: check if segment_mask has polygon_points property
+          if (
+            obj.segment_mask &&
+            typeof obj.segment_mask === "object" &&
+            obj.segment_mask.polygon_points
+          ) {
+            drawPolygonPoints(
+              obj.segment_mask.polygon_points,
+              color,
+              scaleX,
+              scaleY,
+              "Legacy Polygon"
+            );
+          }
+        });
+      }
+
+      function drawPolygonPoints(polygonPoints, color, scaleX, scaleY, label = "") {
+        if (!polygonPoints || polygonPoints.length < 3) return; // Need at least 3 points for a polygon
+
+        // Draw polygon outline
+        maskCtx.strokeStyle = color;
+        maskCtx.lineWidth = 2;
+        maskCtx.beginPath();
+
+        // Move to first point
+        const firstPoint = polygonPoints[0];
+        maskCtx.moveTo(firstPoint[0] * scaleX, firstPoint[1] * scaleY);
+
+        // Draw lines to other points
+        for (let i = 1; i < polygonPoints.length; i++) {
+          const point = polygonPoints[i];
+          maskCtx.lineTo(point[0] * scaleX, point[1] * scaleY);
+        }
+
+        // Close the polygon
+        maskCtx.closePath();
+        maskCtx.stroke();
+
+        // Fill with semi-transparent color
+        maskCtx.fillStyle = color + "20"; // Add alpha for transparency
+        maskCtx.fill();
+
+        // Optional: Draw small dots at each point for debugging
+        if (polygonPoints.length < 50) {
+          // Only for smaller polygons to avoid clutter
+          maskCtx.fillStyle = color;
+          polygonPoints.forEach((point) => {
+            maskCtx.beginPath();
+            maskCtx.arc(point[0] * scaleX, point[1] * scaleY, 1.5, 0, 2 * Math.PI);
+            maskCtx.fill();
+          });
+        }
+      }
+
+      function displaySegmentationMask(segmentationMask) {
+        if (!segmentationMask) return;
+
+        // If segmentationMask is a base64 string, display it as an image
+        if (typeof segmentationMask === "string") {
+          const resultDiv = document.getElementById("result");
+          resultDiv.innerHTML += `
+                    <div style="margin-top: 15px;">
+                        <h4>Segmentation Mask:</h4>
+                        <img src="data:image/png;base64,${segmentationMask}" 
+                             style="max-width: 100%; border: 1px solid #ccc;" 
+                             alt="Segmentation Mask" />
+                    </div>
+                `;
+        } else if (Array.isArray(segmentationMask)) {
+          // If it's a 2D array, treat it like a regular mask
+          drawMask(segmentationMask);
+        }
+      }
+    </script>
+  </body>
+</html>
