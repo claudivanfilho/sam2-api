@@ -265,7 +265,7 @@ async def segment_evf(request: EVFSegmentRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"EVF segmentation failed: {str(e)}")
 
-@app.post("/detect-objects", response_model=ObjectDetectionResponse)
+@app.post("/detect-objects-and-bg-removal", response_model=ObjectDetectionResponse)
 async def detect_objects_endpoint(request: ObjectDetectionRequest):
     """
     Object detection endpoint using Florence-2-large model.

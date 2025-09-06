@@ -71,6 +71,63 @@ def get_douglas_peucker_points(mask, epsilon_ratio=0.002, return_largest_only=Tr
         return [] if return_largest_only else []
 
 
+def get_convex_hull_points(mask, return_largest_only=True):
+    """
+    Extract convex hull points from a binary mask.
+    
+    Args:
+        mask: Binary mask (numpy array) with values 0 or 255
+        return_largest_only: If True, return only the largest contour; if False, return all contours
+        
+    Returns:
+        list: Convex hull points in format [[x, y], [x, y], ...] or list of contours if return_largest_only=False
+    """
+    try:
+        # Convert to binary if needed
+        binary_mask = (mask > 127).astype(np.uint8)
+        
+        # Find contours
+        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            print("⚠️  No contours found in mask")
+            return []
+        
+        if return_largest_only:
+            # Find the largest contour by area
+            largest_contour = max(contours, key=cv2.contourArea)
+            contours_to_process = [largest_contour]
+        else:
+            # Process all contours
+            contours_to_process = contours
+        
+        convex_hulls = []
+        
+        for contour in contours_to_process:
+            # Get convex hull
+            hull = cv2.convexHull(contour)
+            
+            # Convert from OpenCV format [[x, y]] to simple list [[x, y], [x, y], ...]
+            points = hull.reshape(-1, 2).tolist()
+            
+            original_points = len(contour)
+            hull_points = len(points)
+            
+            print(f"✅ Convex hull: {original_points} → {hull_points} points")
+            
+            convex_hulls.append(points)
+        
+        # Return single hull if return_largest_only=True, otherwise return all
+        if return_largest_only:
+            return convex_hulls[0] if convex_hulls else []
+        else:
+            return convex_hulls
+            
+    except Exception as e:
+        print(f"⚠️  Failed to extract convex hull points: {e}")
+        return [] if return_largest_only else []
+
+
 def remove_small_fragments(mask):
     """
     Keep only the largest connected component from a binary mask.

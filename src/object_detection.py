@@ -12,7 +12,7 @@ from .model_manager import get_model_manager
 from .utils import upload_mask_to_s3
 from .sam2_segmentation import sam2_segmenter
 from .mediapipe_operations import mediapipe_processor
-from .image_utils import get_douglas_peucker_points, remove_small_fragments
+from .image_utils import get_douglas_peucker_points, get_convex_hull_points, remove_small_fragments
 from .evf_sam_operations import evf_sam_segmenter
 
 class ObjectDetector:
@@ -20,6 +20,71 @@ class ObjectDetector:
     
     def __init__(self):
         self.model_manager = get_model_manager()
+    
+    def _check_box_overlap(self, current_bbox, all_bboxes, current_index):
+        """
+        Check if current box has at least 80% of another box inside it OR 
+        if current box is at least 80% inside another box.
+        
+        Args:
+            current_bbox: Current bounding box [x1, y1, x2, y2]
+            all_bboxes: List of all bounding boxes
+            current_index: Index of current box in the list
+            
+        Returns:
+            bool: True if current box contains 80%+ of another OR is 80%+ inside another, False otherwise
+        """
+        def calculate_containment_ratios(bbox1, bbox2):
+            """
+            Calculate how much of bbox2 is inside bbox1 and how much of bbox1 is inside bbox2.
+            Returns (ratio_bbox2_in_bbox1, ratio_bbox1_in_bbox2)
+            """
+            x1, y1, x2, y2 = bbox1
+            ox1, oy1, ox2, oy2 = bbox2
+            
+            # Calculate intersection
+            inter_x1 = max(x1, ox1)
+            inter_y1 = max(y1, oy1)
+            inter_x2 = min(x2, ox2)
+            inter_y2 = min(y2, oy2)
+            
+            # Check if there's any intersection
+            if inter_x1 >= inter_x2 or inter_y1 >= inter_y2:
+                return 0.0, 0.0  # No intersection
+            
+            # Calculate intersection area
+            intersection_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+            
+            # Calculate areas of both boxes
+            area_bbox1 = (x2 - x1) * (y2 - y1)
+            area_bbox2 = (ox2 - ox1) * (oy2 - oy1)
+            
+            # Calculate containment ratios
+            # How much of bbox2 is inside bbox1
+            ratio_bbox2_in_bbox1 = intersection_area / area_bbox2 if area_bbox2 > 0 else 0.0
+            # How much of bbox1 is inside bbox2  
+            ratio_bbox1_in_bbox2 = intersection_area / area_bbox1 if area_bbox1 > 0 else 0.0
+            
+            return ratio_bbox2_in_bbox1, ratio_bbox1_in_bbox2
+        
+        containment_threshold = 0.8  # 80% containment threshold
+        
+        for i, other_bbox in enumerate(all_bboxes):
+            if i == current_index:  # Skip self
+                continue
+            
+            # Calculate containment ratios
+            other_in_current, current_in_other = calculate_containment_ratios(current_bbox, other_bbox)
+            
+            # Check if current box contains 80%+ of another box OR current box is 80%+ inside another box
+            if other_in_current >= containment_threshold or current_in_other >= containment_threshold:
+                if other_in_current >= containment_threshold:
+                    print(f"🔍 Current box contains {other_in_current:.1%} of another box")
+                if current_in_other >= containment_threshold:
+                    print(f"🔍 Current box is {current_in_other:.1%} inside another box")
+                return True
+                
+        return False
     
     def detect_objects(self, image_pil, task="<OD>", 
                       confidence_threshold=0.3, text_input=None, return_polygon_points=False, 
@@ -117,13 +182,49 @@ class ObjectDetector:
                 
                 # Define allowed object labels to keep
                 allowed_labels = [
-                    'man', 'woman', 'boy', 'girl', 'person', 'people', 'human',
+                    'man', 'woman', 'boy', 'girl', 'person', 'human',
                     'dog', 'cat', 'horse',
                     'car', 'truck', 'bicycle', 'bus', 'vehicle', 'motorcycle'
                 ]
                 
+                # Filter detections by allowed labels early to avoid expensive processing
+                filtered_bboxes = []
+                filtered_labels = []
+                
+                for bbox, label in zip(bboxes, labels):
+                    # Check if label is in allowed list
+                    if any(allowed_word == label.lower() for allowed_word in allowed_labels):
+                        # Calculate bounding box dimensions for size filtering
+                        x1, y1, x2, y2 = [int(coord) for coord in bbox]
+                        bbox_width = x2 - x1
+                        bbox_height = y2 - y1
+                        
+                        # Filter out objects smaller than 250px in width or height
+                        if bbox_width >= 250 or bbox_height >= 250:
+                            filtered_bboxes.append(bbox)
+                            filtered_labels.append(label)
+                        else:
+                            print(f"⚠️  Filtering out {label}: size {bbox_width}x{bbox_height}px (< 250)")
+                    else:
+                        print(f"⚠️  Filtering out {label}: not in allowed labels")
+                
+                if not filtered_bboxes:
+                    print("⚠️  No valid objects found after filtering")
+                    return {
+                        'objects': [],
+                        'task_used': task,
+                        'segmentation_mask': segmentation_mask,
+                        'raw_output': parsed_answer
+                    }
+                
+                print(f"✅ Filtered from {len(bboxes)} to {len(filtered_bboxes)} objects")
+                
+                # Use filtered lists for further processing
+                bboxes = filtered_bboxes
+                labels = filtered_labels
+                
                 # Define person-related labels to trigger selfie segmentation
-                person_labels = ['human', 'man', 'woman', 'boy', 'girl', 'person', 'people']
+                person_labels = ['human', 'man', 'woman', 'boy', 'girl', 'person']
                 
                 # SAM2 preprocessing already completed in parallel above - no need to repeat
                 print(f"🔄 SAM2 image preprocessing completed in parallel with Florence-2")
@@ -134,11 +235,17 @@ class ObjectDetector:
                 
                 # Use ThreadPoolExecutor to process multiple objects simultaneously
                 with ThreadPoolExecutor(max_workers=4) as executor:
-                    # Submit all object processing tasks with preprocessed image
-                    future_to_data = {
-                        executor.submit(self._process_detected_object, bbox, label, image_array, allowed_labels, person_labels, image, return_polygon_points, douglas_peucker_epsilon): (bbox, label)
-                        for bbox, label in zip(bboxes, labels)
-                    }
+                    # Submit all object processing tasks with preprocessed image and overlap info
+                    future_to_data = {}
+                    for i, (bbox, label) in enumerate(zip(bboxes, labels)):
+                        # Check if this box has overlap issues
+                        has_overlap = self._check_box_overlap(bbox, bboxes, i)
+                        future = executor.submit(
+                            self._process_detected_object, 
+                            bbox, label, image_array, person_labels, 
+                            image, return_polygon_points, douglas_peucker_epsilon, has_overlap
+                        )
+                        future_to_data[future] = (bbox, label)
                     
                     # Collect results as they complete
                     for future in as_completed(future_to_data):
@@ -165,7 +272,7 @@ class ObjectDetector:
             'raw_output': parsed_answer
         }
     
-    def _process_detected_object(self, bbox, label, image_array, allowed_labels, person_labels, original_image, return_polygon_points=False, douglas_peucker_epsilon=0.002):
+    def _process_detected_object(self, bbox, label, image_array, person_labels, original_image, return_polygon_points=False, douglas_peucker_epsilon=0.002, has_overlap=False):
         """
         Process a single detected object (bbox + label) with segmentation.
         This function is designed to be run in parallel for multiple objects.
@@ -174,28 +281,19 @@ class ObjectDetector:
             bbox: Bounding box coordinates [x1, y1, x2, y2]
             label: Object label string
             image_array: Preprocessed numpy array (already set in predictor)
-            allowed_labels: List of allowed object labels
             person_labels: List of person-related labels for selfie segmentation
             original_image: PIL Image object for cropping
             return_polygon_points: If True, return simplified polygon points instead of S3 URLs for masks
             douglas_peucker_epsilon: Epsilon ratio for Douglas-Peucker polygon simplification
+            has_overlap: If True, this box overlaps with another (inside or contains another)
             
         Returns:
             dict: Processed object with segmentation results, or None if filtered out
         """
-        # Filter out objects that are not in the allowed list
-        if not any(allowed_word == label.lower() for allowed_word in allowed_labels):
-            return None  # Skip this object
-        
         # Calculate bounding box dimensions
         x1, y1, x2, y2 = [int(coord) for coord in bbox]
         bbox_width = x2 - x1
         bbox_height = y2 - y1
-        
-        # Filter out objects smaller than 250px in width or height
-        if bbox_width < 250 and bbox_height < 250:
-            print(f"⚠️  Filtering out {label}: size {bbox_width}x{bbox_height}px (< 250)")
-            return None  # Skip this object
         
         obj = {
             'label': label,
@@ -237,15 +335,30 @@ class ObjectDetector:
             
             # Process cleaned mask based on return_polygon_points flag
             if return_polygon_points:
-                # Extract simplified polygon points from the mask
+                # Extract Douglas-Peucker points from the mask (main segment_mask)
                 polygon_points = get_douglas_peucker_points(mask_array_cleaned, epsilon_ratio=douglas_peucker_epsilon)
                 obj['segment_mask'] = polygon_points
-                print(f"✅ Extracted {len(polygon_points)} simplified polygon points for {label}")
+                print(f"✅ Extracted {len(polygon_points)} Douglas-Peucker points for {label}")
+                
+                # Add convex hull segment_mask if this box has overlap issues
+                if has_overlap:
+                    convex_hull_points = get_convex_hull_points(mask_array_cleaned)
+                    obj['segment_mask_convexhull'] = convex_hull_points
+                    print(f"✅ Added convex hull with {len(convex_hull_points)} points for overlapping {label}")
             else:
                 # Upload mask to S3 and return URL
                 crop_box = (x1, y1, x2, y2)
                 segment_mask_url = upload_mask_to_s3(mask_array_cleaned, original_image.size, crop_box=crop_box)
                 obj['segment_mask'] = segment_mask_url
+                
+                # Add convex hull S3 URL if this box has overlap issues
+                if has_overlap:
+                    convex_hull_points = get_convex_hull_points(mask_array_cleaned)
+                    # Create a convex hull mask for S3 upload
+                    convex_hull_mask = self._create_mask_from_points(convex_hull_points, original_image.size)
+                    convex_hull_url = upload_mask_to_s3(convex_hull_mask, original_image.size, crop_box=crop_box, s3_path="convex_hulls")
+                    obj['segment_mask_convexhull'] = convex_hull_url
+                    print(f"✅ Added convex hull S3 URL for overlapping {label}")
             
             # Check if detected object is a person and run selfie segmentation + face landmarks
             if any(person_word in label.lower() for person_word in person_labels):
@@ -816,6 +929,37 @@ class ObjectDetector:
         except Exception as e:
             print(f"⚠️  Failed to expand contour points: {e}")
             return originalPoints
+    
+    def _create_mask_from_points(self, points, image_size):
+        """
+        Create a binary mask from polygon points.
+        
+        Args:
+            points: List of polygon points [[x, y], [x, y], ...]
+            image_size: Tuple of (width, height) for the image
+            
+        Returns:
+            numpy array: Binary mask with polygon filled
+        """
+        try:
+            if not points or len(points) < 3:
+                print("⚠️  Not enough points to create mask")
+                return np.zeros((image_size[1], image_size[0]), dtype=np.uint8)
+            
+            # Create mask with image dimensions (height, width)
+            mask = np.zeros((image_size[1], image_size[0]), dtype=np.uint8)
+            
+            # Convert points to numpy array
+            points_array = np.array(points, dtype=np.int32)
+            
+            # Fill polygon
+            cv2.fillPoly(mask, [points_array], 255)
+            
+            return mask
+            
+        except Exception as e:
+            print(f"⚠️  Failed to create mask from points: {e}")
+            return np.zeros((image_size[1], image_size[0]), dtype=np.uint8)
 
 # Create global instance without initializing models
 object_detector = ObjectDetector()
