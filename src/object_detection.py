@@ -19,7 +19,13 @@ class ObjectDetector:
     """Handles Florence-2 object detection with integrated processing."""
     
     def __init__(self):
-        self.model_manager = get_model_manager()
+        self.model_manager = None
+    
+    def _get_model_manager(self):
+        """Lazy initialization of model manager."""
+        if self.model_manager is None:
+            self.model_manager = get_model_manager(preload_models=False)  # Lazy loading
+        return self.model_manager
     
     def _check_box_overlap(self, current_bbox, all_bboxes, current_index):
         """
@@ -34,6 +40,8 @@ class ObjectDetector:
         Returns:
             bool: True if current box contains 80%+ of another OR is 80%+ inside another, False otherwise
         """
+        print(f"🔍 Checking overlap for box {current_index}: {current_bbox}")
+        
         def calculate_containment_ratios(bbox1, bbox2):
             """
             Calculate how much of bbox2 is inside bbox1 and how much of bbox1 is inside bbox2.
@@ -48,8 +56,11 @@ class ObjectDetector:
             inter_x2 = min(x2, ox2)
             inter_y2 = min(y2, oy2)
             
+            print(f"    📐 Intersection coords: ({inter_x1}, {inter_y1}) to ({inter_x2}, {inter_y2})")
+            
             # Check if there's any intersection
             if inter_x1 >= inter_x2 or inter_y1 >= inter_y2:
+                print(f"    ❌ No intersection detected")
                 return 0.0, 0.0  # No intersection
             
             # Calculate intersection area
@@ -59,19 +70,26 @@ class ObjectDetector:
             area_bbox1 = (x2 - x1) * (y2 - y1)
             area_bbox2 = (ox2 - ox1) * (oy2 - oy1)
             
+            print(f"    📊 Areas - Box1: {area_bbox1}px², Box2: {area_bbox2}px², Intersection: {intersection_area}px²")
+            
             # Calculate containment ratios
             # How much of bbox2 is inside bbox1
             ratio_bbox2_in_bbox1 = intersection_area / area_bbox2 if area_bbox2 > 0 else 0.0
             # How much of bbox1 is inside bbox2  
             ratio_bbox1_in_bbox2 = intersection_area / area_bbox1 if area_bbox1 > 0 else 0.0
             
+            print(f"    📈 Containment ratios - Box2 in Box1: {ratio_bbox2_in_bbox1:.1%}, Box1 in Box2: {ratio_bbox1_in_bbox2:.1%}")
+            
             return ratio_bbox2_in_bbox1, ratio_bbox1_in_bbox2
         
         containment_threshold = 0.8  # 80% containment threshold
+        print(f"🎯 Containment threshold: {containment_threshold:.1%}")
         
         for i, other_bbox in enumerate(all_bboxes):
             if i == current_index:  # Skip self
                 continue
+            
+            print(f"  🔎 Comparing with box {i}: {other_bbox}")
             
             # Calculate containment ratios
             other_in_current, current_in_other = calculate_containment_ratios(current_bbox, other_bbox)
@@ -79,16 +97,19 @@ class ObjectDetector:
             # Check if current box contains 80%+ of another box OR current box is 80%+ inside another box
             if other_in_current >= containment_threshold or current_in_other >= containment_threshold:
                 if other_in_current >= containment_threshold:
-                    print(f"🔍 Current box contains {other_in_current:.1%} of another box")
+                    print(f"✅ OVERLAP DETECTED: Current box contains {other_in_current:.1%} of box {i}")
                 if current_in_other >= containment_threshold:
-                    print(f"🔍 Current box is {current_in_other:.1%} inside another box")
+                    print(f"✅ OVERLAP DETECTED: Current box is {current_in_other:.1%} inside box {i}")
                 return True
+            else:
+                print(f"  ❌ No significant overlap: {other_in_current:.1%} contained, {current_in_other:.1%} inside (threshold: {containment_threshold:.1%})")
                 
+        print(f"🔍 Final result for box {current_index}: No overlaps detected")
         return False
     
     def detect_objects(self, image_pil, task="<OD>", 
                       confidence_threshold=0.3, text_input=None, return_polygon_points=False, 
-                      douglas_peucker_epsilon=0.002):
+                      douglas_peucker_epsilon=0.002, env="staging"):
         """
         Detect objects in an image using Florence-2-large model.
         
@@ -99,15 +120,17 @@ class ObjectDetector:
             text_input: Text input for referring expression segmentation
             return_polygon_points: If True, return simplified polygon points instead of S3 URLs for masks
             douglas_peucker_epsilon: Epsilon ratio for Douglas-Peucker polygon simplification (default: 0.002)
+            env: Environment for S3 upload (staging or production)
             
         Returns:
             dict: Parsed detection results with objects and their bounding boxes
         """
         # Get models (will load if needed)
-        model = self.model_manager.get_model('florence2')
-        processor = self.model_manager.get_model('florence2_processor')
-        device = self.model_manager.get_model('florence2_device')
-        dtype = self.model_manager.get_model('florence2_dtype')
+        model_manager = self._get_model_manager()
+        model = model_manager.get_model('florence2')
+        processor = model_manager.get_model('florence2_processor')
+        device = model_manager.get_model('florence2_device')
+        dtype = model_manager.get_model('florence2_dtype')
         
         # Use the provided PIL image directly
         image = image_pil
@@ -141,7 +164,7 @@ class ObjectDetector:
         def run_sam2_preprocessing():
             """Preprocess image for SAM2"""
             image_array = np.array(image)
-            sam2_segmenter.model_manager.get_model('sam2_predictor').set_image(image_array)
+            sam2_segmenter._get_model_manager().get_model('sam2_predictor').set_image(image_array)
             return image_array
         
         # Execute both operations in parallel
@@ -243,7 +266,7 @@ class ObjectDetector:
                         future = executor.submit(
                             self._process_detected_object, 
                             bbox, label, image_array, person_labels, 
-                            image, return_polygon_points, douglas_peucker_epsilon, has_overlap
+                            image, return_polygon_points, douglas_peucker_epsilon, has_overlap, env
                         )
                         future_to_data[future] = (bbox, label)
                     
@@ -272,7 +295,7 @@ class ObjectDetector:
             'raw_output': parsed_answer
         }
     
-    def _process_detected_object(self, bbox, label, image_array, person_labels, original_image, return_polygon_points=False, douglas_peucker_epsilon=0.002, has_overlap=False):
+    def _process_detected_object(self, bbox, label, image_array, person_labels, original_image, return_polygon_points=False, douglas_peucker_epsilon=0.002, has_overlap=False, env="staging"):
         """
         Process a single detected object (bbox + label) with segmentation.
         This function is designed to be run in parallel for multiple objects.
@@ -286,6 +309,7 @@ class ObjectDetector:
             return_polygon_points: If True, return simplified polygon points instead of S3 URLs for masks
             douglas_peucker_epsilon: Epsilon ratio for Douglas-Peucker polygon simplification
             has_overlap: If True, this box overlaps with another (inside or contains another)
+            env: Environment for S3 upload (staging or production)
             
         Returns:
             dict: Processed object with segmentation results, or None if filtered out
@@ -342,13 +366,15 @@ class ObjectDetector:
                 
                 # Add convex hull segment_mask if this box has overlap issues
                 if has_overlap:
+                    print("==========overlap", label)
                     convex_hull_points = get_convex_hull_points(mask_array_cleaned)
+                    print("==========overlap", label, convex_hull_points)
                     obj['segment_mask_convexhull'] = convex_hull_points
                     print(f"✅ Added convex hull with {len(convex_hull_points)} points for overlapping {label}")
             else:
                 # Upload mask to S3 and return URL
                 crop_box = (x1, y1, x2, y2)
-                segment_mask_url = upload_mask_to_s3(mask_array_cleaned, original_image.size, crop_box=crop_box)
+                segment_mask_url = upload_mask_to_s3(mask_array_cleaned, original_image.size, crop_box=crop_box, env=env)
                 obj['segment_mask'] = segment_mask_url
                 
                 # Add convex hull S3 URL if this box has overlap issues
@@ -356,7 +382,7 @@ class ObjectDetector:
                     convex_hull_points = get_convex_hull_points(mask_array_cleaned)
                     # Create a convex hull mask for S3 upload
                     convex_hull_mask = self._create_mask_from_points(convex_hull_points, original_image.size)
-                    convex_hull_url = upload_mask_to_s3(convex_hull_mask, original_image.size, crop_box=crop_box, s3_path="convex_hulls")
+                    convex_hull_url = upload_mask_to_s3(convex_hull_mask, original_image.size, crop_box=crop_box, s3_path="convex_hulls", env=env)
                     obj['segment_mask_convexhull'] = convex_hull_url
                     print(f"✅ Added convex hull S3 URL for overlapping {label}")
             
@@ -419,7 +445,7 @@ class ObjectDetector:
                     
                     # Create face landmark mask using expanded points
                     face_landmark_result = self._create_face_landmark_mask(
-                        expanded_landmarks, landmarks_image.size, return_polygon_points, douglas_peucker_epsilon
+                        expanded_landmarks, landmarks_image.size, return_polygon_points, douglas_peucker_epsilon, env
                     )
                     if face_landmark_result:
                         if 'multiclasses' not in obj or obj['multiclasses'] is None:
@@ -449,7 +475,7 @@ class ObjectDetector:
                         # Reprocess the masks with the refined segmentation
                         # Still need SAM2 intersection but with adjusted coordinates for refined crop
                         processed_classes = self._process_refined_multiclass_masks(
-                            refined_selfie_result, refined_cropped_image, mask_array_cleaned, x1, y1, x2, y2, original_image, face_landmark_result, return_polygon_points, douglas_peucker_epsilon
+                            refined_selfie_result, refined_cropped_image, mask_array_cleaned, x1, y1, x2, y2, original_image, face_landmark_result, return_polygon_points, douglas_peucker_epsilon, env
                         )
                         
                         if processed_classes:
@@ -494,7 +520,7 @@ class ObjectDetector:
                                     obj['multiclasses']['head_mask'] = polygon_points
                             else:
                                 # Upload mask to S3 and return URL
-                                face_mask_url = upload_mask_to_s3(animal_face_mask_cleaned, cropped_object.size, s3_path="animal_faces")
+                                face_mask_url = upload_mask_to_s3(animal_face_mask_cleaned, cropped_object.size, s3_path="animal_faces", env=env)
                                 if face_mask_url:
                                     if 'multiclasses' not in obj or obj['multiclasses'] is None:
                                         obj['multiclasses'] = {}
@@ -575,7 +601,7 @@ class ObjectDetector:
             print(f"⚠️  Failed to create refined crop: {e}")
             return None
     
-    def _create_face_landmark_mask(self, face_landmarks, image_size, return_polygon_points=False, douglas_peucker_epsilon=0.002):
+    def _create_face_landmark_mask(self, face_landmarks, image_size, return_polygon_points=False, douglas_peucker_epsilon=0.002, env="staging"):
         """
         Create a face mask using convex hull of face landmarks.
         
@@ -636,7 +662,7 @@ class ObjectDetector:
                 }
             else:
                 # Upload cleaned mask to S3
-                mask_url = upload_mask_to_s3(mask_cleaned, image_size, s3_path="face_landmarks")
+                mask_url = upload_mask_to_s3(mask_cleaned, image_size, s3_path="face_landmarks", env=env)
                 return {
                     'url': mask_url,
                     'mask': mask_cleaned
@@ -646,7 +672,7 @@ class ObjectDetector:
             print(f"⚠️  Failed to create face landmark mask: {e}")
             return None
     
-    def _process_refined_multiclass_masks(self, refined_selfie_result, refined_cropped_image, mask_array, x1, y1, x2, y2, original_image, face_landmark_result=None, return_polygon_points=False, douglas_peucker_epsilon=0.002):
+    def _process_refined_multiclass_masks(self, refined_selfie_result, refined_cropped_image, mask_array, x1, y1, x2, y2, original_image, face_landmark_result=None, return_polygon_points=False, douglas_peucker_epsilon=0.002, env="staging"):
         """
         Process refined selfie segmentation masks with SAM2 intersection.
         Only processes hair, face_skin, and others categories from the refined crop.
@@ -769,7 +795,7 @@ class ObjectDetector:
                     # Use ThreadPoolExecutor for parallel S3 uploads
                     with ThreadPoolExecutor(max_workers=3) as upload_executor:
                         upload_futures = {
-                            upload_executor.submit(upload_mask_to_s3, mask, mask_size, s3_path="body_parts_refined"): class_name
+                            upload_executor.submit(upload_mask_to_s3, mask, mask_size, s3_path="body_parts_refined", env=env): class_name
                             for mask, class_name in zip(masks_to_upload, class_names)
                         }
                         

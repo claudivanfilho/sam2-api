@@ -19,7 +19,13 @@ class EVFSAMSegmenter:
     """Handles EVF-SAM2 text-prompted segmentation."""
     
     def __init__(self):
-        self.model_manager = get_model_manager()
+        self.model_manager = None
+    
+    def _get_model_manager(self):
+        """Lazy initialization of model manager."""
+        if self.model_manager is None:
+            self.model_manager = get_model_manager(preload_models=False)  # Lazy loading
+        return self.model_manager
     
     def sam_preprocess(self, x: np.ndarray, img_size=1024, model_type="sam2"):
         """Preprocess for SAM model."""
@@ -27,7 +33,8 @@ class EVFSAMSegmenter:
         x = F.interpolate(x.unsqueeze(0), (img_size, img_size), mode="bilinear", align_corners=False).squeeze(0)
         
         # Get model to match dtype
-        model = self.model_manager.get_model('evf_sam2')
+        model_manager = self._get_model_manager()
+        model = model_manager.get_model('evf_sam2')
         device = model.device
         dtype = model.dtype
         
@@ -64,8 +71,9 @@ class EVFSAMSegmenter:
             list: Segmentation mask as nested list
         """
         # Get model and tokenizer (will load if needed)
-        model = self.model_manager.get_model('evf_sam2')
-        tokenizer = self.model_manager.get_model('evf_tokenizer')
+        model_manager = self._get_model_manager()
+        model = model_manager.get_model('evf_sam2')
+        tokenizer = model_manager.get_model('evf_tokenizer')
         
         # Ensure model is in correct dtype state before each inference
         # This prevents dtype corruption between calls

@@ -12,7 +12,7 @@ The SAM2 API uses environment variables for configuration, particularly for AWS 
 2. **Edit the .env file with your AWS credentials:**
    ```bash
    # AWS S3 Configuration for mask uploads
-   S3_BUCKET_NAME=my-sam2-bucket
+   S3_BUCKET_NAME_STAGING=my-sam2-bucket
    AWS_ACCESS_KEY_ID=AKIA...
    AWS_SECRET_ACCESS_KEY=wJa...
    AWS_REGION=us-east-1
@@ -45,7 +45,7 @@ nano .env
 Set environment variables directly in your shell:
 
 ```bash
-export S3_BUCKET_NAME="my-sam2-bucket"
+export S3_BUCKET_NAME_STAGING="my-sam2-bucket"
 export AWS_ACCESS_KEY_ID="AKIA..."
 export AWS_SECRET_ACCESS_KEY="wJa..."
 export AWS_REGION="us-east-1"
@@ -58,7 +58,7 @@ python3 main.py
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `S3_BUCKET_NAME` | No | `sam2-api-masks` | S3 bucket name for storing segmentation masks |
+| `S3_BUCKET_NAME_STAGING` | No | `sam2-api-masks` | S3 bucket name for storing segmentation masks |
 | `AWS_ACCESS_KEY_ID` | Yes* | None | AWS access key ID with S3 permissions |
 | `AWS_SECRET_ACCESS_KEY` | Yes* | None | AWS secret access key |
 | `AWS_REGION` | No | `us-east-1` | AWS region where your S3 bucket is located |
@@ -85,7 +85,7 @@ import os
 load_dotenv()
 
 # Get variables with fallbacks
-S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "sam2-api-masks")
+S3_BUCKET_NAME_STAGING = os.getenv("S3_BUCKET_NAME_STAGING", "sam2-api-masks")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")  # None if not set
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 ```
@@ -100,10 +100,10 @@ import os
 from dotenv import load_dotenv
 
 print('🔍 Testing environment variable loading...')
-print('Before loading .env:', os.getenv('S3_BUCKET_NAME', 'Not Set'))
+print('Before loading .env:', os.getenv('S3_BUCKET_NAME_STAGING', 'Not Set'))
 
 load_dotenv()
-print('After loading .env:', os.getenv('S3_BUCKET_NAME'))
+print('After loading .env:', os.getenv('S3_BUCKET_NAME_STAGING'))
 print('AWS Region:', os.getenv('AWS_REGION'))
 print('AWS Key ID:', os.getenv('AWS_ACCESS_KEY_ID')[:10] + '...' if os.getenv('AWS_ACCESS_KEY_ID') else 'Not Set')
 "
@@ -144,7 +144,7 @@ try:
         aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
         region_name=os.getenv('AWS_REGION', 'us-east-1')
     )
-    bucket = os.getenv('S3_BUCKET_NAME', 'sam2-api-masks')
+    bucket = os.getenv('S3_BUCKET_NAME_STAGING', 'sam2-api-masks')
     s3.head_bucket(Bucket=bucket)
     print(f'✅ Successfully connected to S3 bucket: {bucket}')
 except Exception as e:

@@ -9,7 +9,7 @@ The `/segment` endpoint now automatically uploads segmentation masks to AWS S3 a
 Set the following environment variables:
 
 ```bash
-S3_BUCKET_NAME=your-s3-bucket-name
+S3_BUCKET_NAME_STAGING=your-s3-bucket-name
 AWS_ACCESS_KEY_ID=your-aws-access-key-id  
 AWS_SECRET_ACCESS_KEY=your-aws-secret-access-key
 AWS_REGION=us-east-1

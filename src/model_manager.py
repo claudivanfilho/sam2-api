@@ -210,13 +210,21 @@ class ModelManager:
     def get_device(self):
         """Get the device being used."""
         return self.device
+    
+    def is_model_loaded(self, model_name):
+        """Check if a specific model is loaded."""
+        return model_name in self._initialized
+    
+    def get_loaded_models(self):
+        """Get list of loaded models."""
+        return list(self._initialized)
 
 # Global model manager instance - will be initialized lazily
 model_manager = None
 
-def get_model_manager():
+def get_model_manager(preload_models=True):
     """Get the global model manager instance, creating it if necessary."""
     global model_manager
     if model_manager is None:
-        model_manager = ModelManager(preload_models=True)  # Enable preloading
+        model_manager = ModelManager(preload_models=preload_models)
     return model_manager

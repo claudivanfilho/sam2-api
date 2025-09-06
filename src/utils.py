@@ -19,10 +19,18 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # AWS S3 Configuration
-S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "growling-thunder-gold")
+S3_BUCKET_NAME_STAGING = os.getenv("S3_BUCKET_NAME_STAGING", "growling-thunder-gold")
+S3_BUCKET_NAME_PROD = os.getenv("S3_BUCKET_NAME_PROD", "flower-manufacturing")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+
+def get_bucket_name(env = "staging"):
+    if env == "production":
+        return S3_BUCKET_NAME_PROD
+    else:
+        return S3_BUCKET_NAME_STAGING
 
 # Initialize S3 client
 s3_client = None
@@ -70,7 +78,7 @@ def load_image_from_source(image_b64=None, image_url=None):
     
     return image
 
-def upload_mask_to_s3(mask_array, original_image_size=None, crop_box=None, s3_path="sam2-api-masks"):
+def upload_mask_to_s3(mask_array, original_image_size=None, crop_box=None, s3_path="sam2-api-masks", env="staging"):
     """
     Upload segmentation mask to S3 as a 1-bit PNG image for optimal binary image compression.
     
@@ -122,11 +130,12 @@ def upload_mask_to_s3(mask_array, original_image_size=None, crop_box=None, s3_pa
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         unique_id = str(uuid.uuid4())[:8]
         filename = f"{s3_path.strip('/')}/{timestamp}_{unique_id}.png"
+        bucket_name = get_bucket_name(env)
         
         # Upload to S3 with optimized settings
         s3_client.upload_fileobj(
             buffer,
-            S3_BUCKET_NAME,
+            bucket_name,
             filename,
             ExtraArgs={
                 'ContentType': 'image/png',
@@ -139,7 +148,7 @@ def upload_mask_to_s3(mask_array, original_image_size=None, crop_box=None, s3_pa
         s3_upload_duration = (s3_upload_end_time - s3_upload_start_time).total_seconds()
         
         # Generate public URL
-        s3_url = f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{filename}"
+        s3_url = f"https://{bucket_name}.s3.{AWS_REGION}.amazonaws.com/{filename}"
         print(f"✅ Mask uploaded to S3 (optimized 1-bit PNG): {s3_url}")
         print(f"⏱️  S3 upload took {s3_upload_duration:.3f} seconds")
         return s3_url
@@ -165,7 +174,7 @@ def encode_image_to_base64(image):
     image.save(buffer, format="PNG")
     return base64.b64encode(buffer.getvalue()).decode('utf-8')
 
-def upload_image_to_s3(image_pil, s3_path="background-removed-images"):
+def upload_image_to_s3(image_pil, s3_path="background-removed-images", env = "staging"):
     """
     Upload PIL image to S3 as PNG.
     
@@ -193,10 +202,11 @@ def upload_image_to_s3(image_pil, s3_path="background-removed-images"):
         unique_id = str(uuid.uuid4())[:8]
         filename = f"{s3_path.strip('/')}/{timestamp}_{unique_id}.png"
         
+        bucket_name = get_bucket_name("staging")  # Default to staging, modify as needed
         # Upload to S3
         s3_client.upload_fileobj(
             image_buffer,
-            S3_BUCKET_NAME,
+            bucket_name,
             filename,
             ExtraArgs={
                 'ContentType': 'image/png',
@@ -206,7 +216,7 @@ def upload_image_to_s3(image_pil, s3_path="background-removed-images"):
         )
         
         # Generate S3 URL
-        s3_url = f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{filename}"
+        s3_url = f"https://{bucket_name}.s3.{AWS_REGION}.amazonaws.com/{filename}"
         
         s3_upload_end_time = datetime.now()
         s3_upload_duration = (s3_upload_end_time - s3_upload_start_time).total_seconds()

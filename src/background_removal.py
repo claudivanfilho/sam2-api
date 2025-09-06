@@ -16,7 +16,13 @@ class BackgroundRemover:
     """Handles background removal using BiRefNet model."""
     
     def __init__(self):
-        self.model_manager = get_model_manager()
+        self.model_manager = None
+    
+    def _get_model_manager(self):
+        """Lazy initialization of model manager."""
+        if self.model_manager is None:
+            self.model_manager = get_model_manager(preload_models=False)  # Lazy loading
+        return self.model_manager
     
     def remove_background(self, image_b64=None, image_url=None, image_pil=None, return_mask=False):
         """
@@ -33,9 +39,10 @@ class BackgroundRemover:
                  optionally 'mask_pil' if return_mask=True
         """
         # Get model and transform (will load if needed)
-        model = self.model_manager.get_model('birefnet')
-        transform = self.model_manager.get_transform('birefnet')
-        device = self.model_manager.get_device()
+        model_manager = self._get_model_manager()
+        model = model_manager.get_model('birefnet')
+        transform = model_manager.get_transform('birefnet')
+        device = model_manager.get_device()
         
         # Load image from source
         if image_pil is not None:

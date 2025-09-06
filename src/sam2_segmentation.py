@@ -12,10 +12,16 @@ class SAM2Segmenter:
     """Handles SAM2 segmentation with various prompts."""
     
     def __init__(self):
-        self.model_manager = get_model_manager()
+        self.model_manager = None
+    
+    def _get_model_manager(self):
+        """Lazy initialization of model manager."""
+        if self.model_manager is None:
+            self.model_manager = get_model_manager(preload_models=False)  # Lazy loading
+        return self.model_manager
     
     def segment_image(self, image_b64=None, image_url=None, image_pil=None, 
-                     point=None, box=None, points=None, boxes=None, crop_to_box=False):
+                     point=None, box=None, points=None, boxes=None, crop_to_box=False, env="staging"):
         """
         Segment an image with optional prompts.
         
@@ -28,12 +34,14 @@ class SAM2Segmenter:
             points: Multiple point prompts
             boxes: Multiple box prompts
             crop_to_box: If True and a box is provided, only upload the cropped mask region to S3
+            env: Environment for S3 upload (staging or production)
             
         Returns:
             str: S3 URL of the uploaded mask
         """
         # Get predictor (will load if needed)
-        predictor = self.model_manager.get_model('sam2_predictor')
+        model_manager = self._get_model_manager()
+        predictor = model_manager.get_model('sam2_predictor')
         
         # Load image from source
         if image_pil is not None:
@@ -101,7 +109,7 @@ class SAM2Segmenter:
         if crop_to_box and box:
             crop_box = (int(box.x1), int(box.y1), int(box.x2), int(box.y2))
         
-        mask_url = upload_mask_to_s3(mask_array, image.size, crop_box=crop_box)
+        mask_url = upload_mask_to_s3(mask_array, image.size, crop_box=crop_box, env=env)
         
         return mask_url
     
@@ -118,7 +126,8 @@ class SAM2Segmenter:
             numpy.ndarray: mask_array 
         """
         # Get predictor (will load if needed)
-        predictor = self.model_manager.get_model('sam2_predictor')
+        model_manager = self._get_model_manager()
+        predictor = model_manager.get_model('sam2_predictor')
         
         # Prepare box input for SAM2
         input_boxes = np.array([bbox], dtype=np.float32)

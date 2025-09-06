@@ -17,6 +17,9 @@ from src.evf_sam_operations import evf_sam_segmenter
 from src.mediapipe_operations import mediapipe_processor
 from src.model_manager import get_model_manager
 
+# Global variable to track loading mode (default is lazy loading)
+LAZY_LOAD_MODE = True
+
 app = FastAPI()
 
 # Add CORS middleware
@@ -30,17 +33,22 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
-    """Preload all models on application startup."""
-    print("🚀 FastAPI startup: Preloading all AI models...")
-    model_manager = get_model_manager()  # This will trigger preloading
-    print("✅ All models preloaded successfully!")
+    """Preload all models on application startup if not in lazy load mode."""
+    global LAZY_LOAD_MODE
+    if not LAZY_LOAD_MODE:
+        print("🚀 FastAPI startup: Preloading all AI models...")
+        model_manager = get_model_manager(preload_models=True)  # This will trigger preloading
+        print("✅ All models preloaded successfully!")
+    else:
+        print("⏳ FastAPI startup: Lazy loading mode (default) - models will be loaded on first use")
 
-def process_background_removal_and_upload(image_pil):
+def process_background_removal_and_upload(image_pil, env="staging"):
     """
     Process background removal and upload both mask and resized image to S3 in parallel.
     
     Args:
         image_pil: PIL Image object
+        env: Environment for S3 upload (staging or production)
         
     Returns:
         tuple: (background_removed_url, mask_url) - S3 URLs for both uploads
@@ -78,12 +86,12 @@ def process_background_removal_and_upload(image_pil):
     # Define async upload functions
     async def upload_mask():
         loop = asyncio.get_event_loop()
-        upload_func = partial(upload_image_to_s3, background_mask_pil, s3_path="background-removal-masks")
+        upload_func = partial(upload_image_to_s3, background_mask_pil, s3_path="background-removal-masks", env=env)
         return await loop.run_in_executor(None, upload_func)
     
     async def upload_background_image():
         loop = asyncio.get_event_loop()
-        upload_func = partial(upload_image_to_s3, background_removed_resized, s3_path="background-removed-images")
+        upload_func = partial(upload_image_to_s3, background_removed_resized, s3_path="background-removed-images", env=env)
         return await loop.run_in_executor(None, upload_func)
     
     # Run both uploads in parallel
@@ -120,6 +128,7 @@ class SegmentRequest(BaseModel):
     box: Box = None          # Optional box prompt
     points: list[Point] = None  # Optional multiple points
     boxes: list[Box] = None     # Optional multiple boxes
+    environment: str = "staging"  # Environment for S3 upload (staging or production)
 
 class SegmentResponse(BaseModel):
     mask_url: Optional[str] = None  # S3 URL of the uploaded mask image
@@ -150,12 +159,14 @@ class ObjectDetectionRequest(BaseModel):
     text_input: str = None     # Text input for referring expression segmentation
     return_polygon_points: bool = False  # If True, return simplified polygon points instead of S3 URLs for masks
     douglas_peucker_epsilon: float = 0.002  # Douglas-Peucker simplification epsilon ratio (default: 0.002 = 0.2%)
+    environment: str = "staging"  # Environment for S3 upload (staging or production)
 
 class DetectedObject(BaseModel):
     label: str
     bbox: list[float]  # [x1, y1, x2, y2]
     multiclasses: Optional[dict] = None  # Selfie segmentation result (URLs or polygon points) for person objects
     segment_mask: Optional[Union[str, list[list[float]]]] = None  # S3 URL or polygon points of SAM2 segmentation mask
+    segment_mask_convexhull: Optional[Union[str, list[list[float]]]] = None  # S3 URL or polygon points of SAM2 segmentation mask
 
 class ObjectDetectionResponse(BaseModel):
     objects: list[DetectedObject]
@@ -213,6 +224,15 @@ async def segment_runpod_style(request: SegmentRequest):
       ]
     }
     
+    7. Specify environment for S3 uploads:
+    {
+      "image_b64": "<base64 encoded image>",
+      "environment": "production"
+    }
+    
+    Parameters:
+    - environment: Environment for S3 uploads ("staging" or "production", default: "staging")
+    
     Note: Either image_b64 OR imageUrl must be provided (not both).
     
     Returns:
@@ -236,7 +256,8 @@ async def segment_runpod_style(request: SegmentRequest):
             point=request.point,
             box=request.box,
             points=request.points,
-            boxes=request.boxes
+            boxes=request.boxes,
+            env=request.environment
         )
         return SegmentResponse(mask_url=mask_url)
     except ValueError as e:
@@ -305,9 +326,16 @@ async def detect_objects_endpoint(request: ObjectDetectionRequest):
       "douglas_peucker_epsilon": 0.001
     }
     
+    6. Specify environment for S3 uploads:
+    {
+      "image_b64": "<base64 encoded image>",
+      "environment": "production"
+    }
+    
     Parameters:
     - return_polygon_points: If true, returns simplified polygon points instead of S3 URLs for masks
     - douglas_peucker_epsilon: Controls polygon simplification (lower = more detailed, higher = simpler)
+    - environment: Environment for S3 uploads ("staging" or "production", default: "staging")
     
     Supported tasks:
     - "<OD>": Object detection (default)
@@ -346,7 +374,7 @@ async def detect_objects_endpoint(request: ObjectDetectionRequest):
         async def run_background_processing():
             """Run background removal and upload in thread pool."""
             loop = asyncio.get_event_loop()
-            background_func = partial(process_background_removal_and_upload, image_pil)
+            background_func = partial(process_background_removal_and_upload, image_pil, env=request.environment)
             return await loop.run_in_executor(None, background_func)
         
         async def run_object_detection():
@@ -359,7 +387,8 @@ async def detect_objects_endpoint(request: ObjectDetectionRequest):
                 confidence_threshold=request.confidence_threshold,
                 text_input=request.text_input,
                 return_polygon_points=request.return_polygon_points,
-                douglas_peucker_epsilon=request.douglas_peucker_epsilon
+                douglas_peucker_epsilon=request.douglas_peucker_epsilon,
+                env=request.environment
             )
             return await loop.run_in_executor(None, detection_func)
         
@@ -375,7 +404,8 @@ async def detect_objects_endpoint(request: ObjectDetectionRequest):
                 label=obj['label'],
                 bbox=obj['bbox'],
                 multiclasses=obj.get('multiclasses'),
-                segment_mask=obj.get('segment_mask')
+                segment_mask=obj.get('segment_mask'),
+                segment_mask_convexhull=obj.get('segment_mask_convexhull'),
             )
             for obj in result['objects']
         ]
@@ -439,16 +469,25 @@ async def remove_background_endpoint(request: RemoveBackgroundRequest):
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    model_manager = get_model_manager()
+    global LAZY_LOAD_MODE
+    
+    # Get model manager with appropriate loading mode
+    model_manager = get_model_manager(preload_models=not LAZY_LOAD_MODE)
+    
+    # Check which models are actually loaded
+    loaded_models = model_manager.get_loaded_models()
+    
     return {
         "status": "healthy",
         "device": model_manager.get_device(),
-        "model_loaded": True,
-        "evf_model_loaded": True,
-        "background_removal_loaded": True,
-        "object_detection_loaded": True,
-        "face_landmarks_loaded": True,
+        "lazy_load_mode": LAZY_LOAD_MODE,
+        "model_loaded": model_manager.is_model_loaded('sam2'),
+        "evf_model_loaded": model_manager.is_model_loaded('evf_sam2'),
+        "background_removal_loaded": model_manager.is_model_loaded('birefnet'),
+        "object_detection_loaded": model_manager.is_model_loaded('florence2'),
+        "face_landmarks_loaded": True,  # MediaPipe is lightweight and always available
         "flux_model_loaded": False,
+        "loaded_models": loaded_models,
         "models": {
             "sam2": "SAM2.1 Large (Segmentation)",
             "evf_sam2": "EVF-SAM2 (Text-prompted Segmentation)",
@@ -459,11 +498,40 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
+    import argparse
     
-    # Preload all models at startup
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="SAM2 API Server")
+    parser.add_argument(
+        "--eager-load", 
+        action="store_true", 
+        help="Enable eager loading of models (models are preloaded at startup). Default is lazy loading."
+    )
+    parser.add_argument(
+        "--host", 
+        default="0.0.0.0", 
+        help="Host to bind the server to (default: 0.0.0.0)"
+    )
+    parser.add_argument(
+        "--port", 
+        type=int, 
+        default=8000, 
+        help="Port to bind the server to (default: 8000)"
+    )
+    args = parser.parse_args()
+    
+    # Set global lazy load mode (default is True, unless --eager-load is specified)
+    LAZY_LOAD_MODE = not args.eager_load
+    
     print("🚀 Starting FastAPI server...")
-    print("📦 Initializing and preloading all AI models...")
-    model_manager = get_model_manager()  # This will trigger preloading
-    print(f"✅ Server ready on {model_manager.get_device()}")
     
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    if LAZY_LOAD_MODE:
+        print("⏳ Lazy loading mode (default) - models will be loaded on first use")
+        # Don't preload models, they will be loaded when first accessed
+    else:
+        print("📦 Eager loading mode - preloading all AI models...")
+        model_manager = get_model_manager(preload_models=True)  # This will trigger preloading
+        print(f"✅ All models preloaded on {model_manager.get_device()}")
+    
+    print(f"🌐 Server starting on {args.host}:{args.port}")
+    uvicorn.run(app, host=args.host, port=args.port)
